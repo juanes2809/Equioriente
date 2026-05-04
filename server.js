@@ -791,4 +791,15 @@ app.get("/alquileres/:id/pdf", authMiddleware, async (req, res) => {
     }
 });
 
+async function initUsuarios() {
+    const admin = await sqOne(sb.from(T.u).select("id").eq("usuario", "admin"));
+    if (!admin) {
+        const hash = await bcrypt.hash("1234", SALT_ROUNDS);
+        await sqInsert(T.u, { usuario: "admin",    password: hash, rol: "admin" });
+        await sqInsert(T.u, { usuario: "operario", password: hash, rol: "operario" });
+        console.log("Usuarios por defecto creados: admin/1234, operario/1234");
+    }
+}
+
+initUsuarios().catch(e => console.error("Error creando usuarios:", e.message));
 app.listen(PORT, () => console.log(`Servidor corriendo en http://localhost:${PORT}`));
