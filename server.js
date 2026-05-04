@@ -90,7 +90,7 @@ const flat = (row, joinKey, mapping) => {
 // ── Express ───────────────────────────────────────────
 const app = express();
 app.use(express.json());
-app.use(express.static("."));
+app.use(express.static(__dirname));
 
 if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR);
 
