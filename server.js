@@ -1,10 +1,10 @@
+require("dotenv").config();
 const express = require("express");
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
-const { execSync } = require("child_process");
 const fs = require("fs");
 const ExcelJS = require("exceljs");
-const os = require("os");
+const PDFDocument = require("pdfkit");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
@@ -19,164 +19,200 @@ app.use(express.static("."));
 // ── Ensure backup directory exists ───────────────────
 if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR);
 
-const db = new sqlite3.Database("rental.db");
+// ── Database: SQLite (local) or PostgreSQL (Supabase) ─
+let pgPool = null;
+let db = null;
 
-// Helper: promisified db methods
-const dbRun = (sql, params = []) => new Promise((resolve, reject) => {
-    db.run(sql, params, function(err) {
-        if (err) reject(err); else resolve(this);
+if (process.env.DATABASE_URL) {
+    const { Pool, types } = require("pg");
+    // Return timestamp columns as strings to match SQLite behavior
+    types.setTypeParser(1114, v => v); // TIMESTAMP
+    types.setTypeParser(1184, v => v); // TIMESTAMPTZ
+    types.setTypeParser(1082, v => v); // DATE
+    pgPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
     });
-});
-const dbGet = (sql, params = []) => new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => { if (err) reject(err); else resolve(row); });
-});
-const dbAll = (sql, params = []) => new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => { if (err) reject(err); else resolve(rows || []); });
-});
+    console.log("Usando PostgreSQL (Supabase)");
+} else {
+    db = new sqlite3.Database("rental.db");
+    console.log("Usando SQLite local");
+}
 
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS usuarios (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        usuario TEXT UNIQUE,
-        password TEXT,
-        rol TEXT
-    )`);
+// ── SQL translator: SQLite dialect → PostgreSQL ───────
+function pgSQL(sql) {
+    let i = 0;
+    const isIgnoreInsert = /INSERT\s+OR\s+IGNORE\s+INTO/i.test(sql);
+    let s = sql
+        // strftime + nested date(): strftime('%Y-%m', date('now', '-N months'))
+        .replace(/strftime\s*\(\s*'%Y-%m'\s*,\s*date\s*\(\s*'now'\s*,\s*'([^']+)'\s*\)\s*\)/gi,
+            (_, iv) => `TO_CHAR(NOW() + INTERVAL '${iv}', 'YYYY-MM')`)
+        // strftime('%Y-%m', 'now')
+        .replace(/strftime\s*\(\s*'%Y-%m'\s*,\s*'now'\s*\)/gi, "TO_CHAR(NOW(), 'YYYY-MM')")
+        // strftime('%Y-%m', col)
+        .replace(/strftime\s*\(\s*'%Y-%m'\s*,\s*([a-zA-Z_.]+)\s*\)/gi,
+            (_, col) => `TO_CHAR((${col})::timestamptz, 'YYYY-MM')`)
+        // date('now', '-N months/month')
+        .replace(/\bdate\s*\(\s*'now'\s*,\s*'([^']+)'\s*\)/gi,
+            (_, iv) => `(NOW() + INTERVAL '${iv}')::date`)
+        // DATE('now')
+        .replace(/\bDATE\s*\(\s*'now'\s*\)/gi, "CURRENT_DATE")
+        // DATE(col) → (col)::date
+        .replace(/\bDATE\s*\(\s*([a-zA-Z_.]+)\s*\)/g,
+            (_, col) => `(${col})::date`)
+        // CAST(julianday('now') - julianday(col) AS INTEGER)
+        .replace(/CAST\s*\(\s*julianday\s*\(\s*'now'\s*\)\s*-\s*julianday\s*\(([^)]+)\)\s+AS\s+INTEGER\s*\)/gi,
+            (_, col) => `EXTRACT(DAY FROM (CURRENT_DATE - (${col.trim()})::date))::int`)
+        // MAX(0, expr) → GREATEST(0, expr)
+        .replace(/\bMAX\s*\(\s*0\s*,/g, "GREATEST(0,")
+        // CAST(col AS TEXT) → col::text  (for LIKE queries)
+        .replace(/CAST\s*\(\s*([a-zA-Z_.]+)\s+AS\s+TEXT\s*\)/gi, "($1)::text")
+        // INSERT OR IGNORE
+        .replace(/INSERT\s+OR\s+IGNORE\s+INTO/gi, "INSERT INTO")
+        // ? → $N param placeholders
+        .replace(/\?/g, () => `$${++i}`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS clientes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nombre TEXT NOT NULL,
-        telefono TEXT,
-        direccion TEXT,
-        identificacion TEXT UNIQUE
-    )`);
+    if (isIgnoreInsert) s = s.trimEnd().replace(/;?\s*$/, "") + " ON CONFLICT DO NOTHING";
+    return s;
+}
 
-    db.run(`CREATE TABLE IF NOT EXISTS categorias (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nombre TEXT UNIQUE
-    )`);
+// ── Unified db helpers ────────────────────────────────
+const dbGet = async (sql, params = []) => {
+    if (pgPool) {
+        const r = await pgPool.query(pgSQL(sql), params);
+        return r.rows[0] || null;
+    }
+    return new Promise((resolve, reject) =>
+        db.get(sql, params, (err, row) => err ? reject(err) : resolve(row)));
+};
 
-    db.run(`CREATE TABLE IF NOT EXISTS articulos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        referencia TEXT UNIQUE NOT NULL,
-        nombre TEXT NOT NULL,
-        stock_total INTEGER NOT NULL DEFAULT 0,
-        stock_disponible INTEGER NOT NULL DEFAULT 0,
-        stock_mantenimiento INTEGER NOT NULL DEFAULT 0,
-        stock_danado INTEGER NOT NULL DEFAULT 0,
-        stock_minimo INTEGER NOT NULL DEFAULT 0,
-        precio_dia REAL NOT NULL DEFAULT 0,
-        es_externo INTEGER NOT NULL DEFAULT 0,
-        empresa_externa TEXT,
-        costo_proveedor_dia REAL DEFAULT 0,
-        categoria_id INTEGER,
-        FOREIGN KEY(categoria_id) REFERENCES categorias(id)
-    )`);
+const dbAll = async (sql, params = []) => {
+    if (pgPool) {
+        const r = await pgPool.query(pgSQL(sql), params);
+        return r.rows;
+    }
+    return new Promise((resolve, reject) =>
+        db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows || [])));
+};
 
-    db.run(`CREATE TABLE IF NOT EXISTS alquileres (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        cliente_id INTEGER NOT NULL,
-        usuario_id INTEGER NOT NULL,
-        fecha_salida TEXT DEFAULT CURRENT_TIMESTAMP,
-        fecha_devolucion_esperada TEXT,
-        fecha_devolucion_real TEXT,
-        estado TEXT DEFAULT 'activo',
-        notas TEXT,
-        FOREIGN KEY(cliente_id) REFERENCES clientes(id),
-        FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
-    )`);
+const dbRun = async (sql, params = []) => {
+    if (pgPool) {
+        let pgSql = pgSQL(sql);
+        if (/^\s*INSERT\s+INTO/i.test(pgSql) && !/RETURNING/i.test(pgSql))
+            pgSql = pgSql.trimEnd() + " RETURNING id";
+        const r = await pgPool.query(pgSql, params);
+        return { lastID: r.rows[0]?.id || null, changes: r.rowCount };
+    }
+    return new Promise((resolve, reject) =>
+        db.run(sql, params, function(err) {
+            if (err) reject(err);
+            else resolve({ lastID: this.lastID, changes: this.changes });
+        }));
+};
 
-    db.run(`CREATE TABLE IF NOT EXISTS alquiler_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        alquiler_id INTEGER NOT NULL,
-        articulo_id INTEGER NOT NULL,
-        cantidad INTEGER NOT NULL,
-        cantidad_devuelta INTEGER NOT NULL DEFAULT 0,
-        precio_dia_aplicado REAL NOT NULL,
-        dias_acordados INTEGER NOT NULL DEFAULT 1,
-        dias_reales INTEGER,
-        total_calculado REAL,
-        FOREIGN KEY(alquiler_id) REFERENCES alquileres(id),
-        FOREIGN KEY(articulo_id) REFERENCES articulos(id)
-    )`);
+// ── Schema init ───────────────────────────────────────
+async function initDB() {
+    if (pgPool) {
+        // PostgreSQL / Supabase schema
+        const stmts = [
+            `CREATE TABLE IF NOT EXISTS equioriente_usuarios (
+                id BIGSERIAL PRIMARY KEY, usuario TEXT UNIQUE, password TEXT, rol TEXT)`,
+            `CREATE TABLE IF NOT EXISTS equioriente_clientes (
+                id BIGSERIAL PRIMARY KEY, nombre TEXT NOT NULL, telefono TEXT,
+                direccion TEXT, identificacion TEXT UNIQUE)`,
+            `CREATE TABLE IF NOT EXISTS equioriente_categorias (
+                id BIGSERIAL PRIMARY KEY, nombre TEXT UNIQUE)`,
+            `CREATE TABLE IF NOT EXISTS equioriente_articulos (
+                id BIGSERIAL PRIMARY KEY, referencia TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL,
+                stock_total INTEGER NOT NULL DEFAULT 0, stock_disponible INTEGER NOT NULL DEFAULT 0,
+                stock_mantenimiento INTEGER NOT NULL DEFAULT 0, stock_danado INTEGER NOT NULL DEFAULT 0,
+                stock_minimo INTEGER NOT NULL DEFAULT 0, precio_dia FLOAT NOT NULL DEFAULT 0,
+                es_externo SMALLINT NOT NULL DEFAULT 0, empresa_externa TEXT,
+                costo_proveedor_dia FLOAT DEFAULT 0, categoria_id BIGINT REFERENCES equioriente_categorias(id))`,
+            `CREATE TABLE IF NOT EXISTS equioriente_alquileres (
+                id BIGSERIAL PRIMARY KEY, cliente_id BIGINT NOT NULL REFERENCES equioriente_clientes(id),
+                usuario_id BIGINT NOT NULL REFERENCES equioriente_usuarios(id),
+                fecha_salida TIMESTAMPTZ DEFAULT NOW(),
+                fecha_devolucion_esperada TEXT, fecha_devolucion_real TIMESTAMPTZ,
+                estado TEXT DEFAULT 'activo', notas TEXT)`,
+            `CREATE TABLE IF NOT EXISTS equioriente_alquiler_items (
+                id BIGSERIAL PRIMARY KEY, alquiler_id BIGINT NOT NULL REFERENCES equioriente_alquileres(id),
+                articulo_id BIGINT NOT NULL REFERENCES equioriente_articulos(id),
+                cantidad INTEGER NOT NULL, cantidad_devuelta INTEGER NOT NULL DEFAULT 0,
+                precio_dia_aplicado FLOAT NOT NULL, dias_acordados INTEGER NOT NULL DEFAULT 1,
+                dias_reales INTEGER, total_calculado FLOAT)`,
+            `CREATE TABLE IF NOT EXISTS equioriente_devoluciones_proveedor (
+                id BIGSERIAL PRIMARY KEY, articulo_id BIGINT NOT NULL REFERENCES equioriente_articulos(id),
+                cantidad INTEGER NOT NULL, fecha_retiro TEXT, fecha_devolucion TIMESTAMPTZ DEFAULT NOW(),
+                dias_reales INTEGER, costo_proveedor_dia FLOAT, total_costo FLOAT, notas TEXT,
+                usuario_id BIGINT REFERENCES equioriente_usuarios(id))`,
+            `CREATE TABLE IF NOT EXISTS equioriente_movimientos_inventario (
+                id BIGSERIAL PRIMARY KEY, articulo_id BIGINT NOT NULL REFERENCES equioriente_articulos(id),
+                tipo TEXT NOT NULL, cantidad INTEGER NOT NULL, motivo TEXT, referencia_id BIGINT,
+                usuario_id BIGINT REFERENCES equioriente_usuarios(id), fecha TIMESTAMPTZ DEFAULT NOW())`,
+            `CREATE TABLE IF NOT EXISTS equioriente_registro_danos (
+                id BIGSERIAL PRIMARY KEY, articulo_id BIGINT NOT NULL REFERENCES equioriente_articulos(id),
+                alquiler_id BIGINT REFERENCES equioriente_alquileres(id), cliente_id BIGINT REFERENCES equioriente_clientes(id),
+                cantidad INTEGER NOT NULL DEFAULT 1, tipo TEXT NOT NULL DEFAULT 'dano',
+                descripcion TEXT, costo_reparacion FLOAT DEFAULT 0, cobrado_cliente SMALLINT DEFAULT 0,
+                monto_cobrado FLOAT DEFAULT 0, estado TEXT DEFAULT 'pendiente',
+                usuario_id BIGINT REFERENCES equioriente_usuarios(id), fecha TIMESTAMPTZ DEFAULT NOW())`,
+        ];
+        for (const sql of stmts) await pgPool.query(sql);
 
-    db.run(`CREATE TABLE IF NOT EXISTS devoluciones_proveedor (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        articulo_id INTEGER NOT NULL,
-        cantidad INTEGER NOT NULL,
-        fecha_retiro TEXT,
-        fecha_devolucion TEXT DEFAULT CURRENT_TIMESTAMP,
-        dias_reales INTEGER,
-        costo_proveedor_dia REAL,
-        total_costo REAL,
-        notas TEXT,
-        usuario_id INTEGER,
-        FOREIGN KEY(articulo_id) REFERENCES articulos(id),
-        FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
-    )`);
-
-    // Historial de movimientos de inventario
-    db.run(`CREATE TABLE IF NOT EXISTS movimientos_inventario (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        articulo_id INTEGER NOT NULL,
-        tipo TEXT NOT NULL,
-        cantidad INTEGER NOT NULL,
-        motivo TEXT,
-        referencia_id INTEGER,
-        usuario_id INTEGER,
-        fecha TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(articulo_id) REFERENCES articulos(id),
-        FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
-    )`);
-
-    // Registro de daños y pérdidas
-    db.run(`CREATE TABLE IF NOT EXISTS registro_danos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        articulo_id INTEGER NOT NULL,
-        alquiler_id INTEGER,
-        cliente_id INTEGER,
-        cantidad INTEGER NOT NULL DEFAULT 1,
-        tipo TEXT NOT NULL DEFAULT 'dano',
-        descripcion TEXT,
-        costo_reparacion REAL DEFAULT 0,
-        cobrado_cliente INTEGER DEFAULT 0,
-        monto_cobrado REAL DEFAULT 0,
-        estado TEXT DEFAULT 'pendiente',
-        usuario_id INTEGER,
-        fecha TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(articulo_id) REFERENCES articulos(id),
-        FOREIGN KEY(alquiler_id) REFERENCES alquileres(id),
-        FOREIGN KEY(cliente_id) REFERENCES clientes(id),
-        FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
-    )`);
-
-    // Add new columns to existing tables if they don't exist (migration)
-    db.run(`ALTER TABLE articulos ADD COLUMN stock_mantenimiento INTEGER NOT NULL DEFAULT 0`, () => {});
-    db.run(`ALTER TABLE articulos ADD COLUMN stock_danado INTEGER NOT NULL DEFAULT 0`, () => {});
-    db.run(`ALTER TABLE articulos ADD COLUMN stock_minimo INTEGER NOT NULL DEFAULT 0`, () => {});
-    db.run(`ALTER TABLE alquiler_items ADD COLUMN cantidad_devuelta INTEGER NOT NULL DEFAULT 0`, () => {});
-
-    // Migrate plaintext passwords to bcrypt
-    db.all("SELECT id, password FROM usuarios", [], (err, users) => {
-        if (users) {
-            users.forEach(u => {
-                if (!u.password.startsWith("$2b$") && !u.password.startsWith("$2a$")) {
-                    const hash = bcrypt.hashSync(u.password, SALT_ROUNDS);
-                    db.run("UPDATE usuarios SET password=? WHERE id=?", [hash, u.id]);
-                }
-            });
+        // Default seed rows
+        await pgPool.query(`INSERT INTO equioriente_categorias (nombre) VALUES ('General') ON CONFLICT DO NOTHING`);
+        const adminHash = bcrypt.hashSync("1234", SALT_ROUNDS);
+        await pgPool.query(`INSERT INTO equioriente_usuarios (usuario, password, rol) VALUES ('admin', $1, 'admin') ON CONFLICT DO NOTHING`, [adminHash]);
+        await pgPool.query(`INSERT INTO equioriente_usuarios (usuario, password, rol) VALUES ('operario', $1, 'operario') ON CONFLICT DO NOTHING`, [adminHash]);
+        console.log("Schema PostgreSQL OK");
+    } else {
+        // SQLite schema (run synchronously via serialize)
+        await new Promise(resolve => db.serialize(() => {
+            const run = sql => db.run(sql, () => {});
+            // ── One-time migration: rename old tables (no prefix) to new names ──
+            const oldTables = [
+                'registro_danos', 'movimientos_inventario', 'devoluciones_proveedor',
+                'alquiler_items', 'alquileres', 'articulos', 'clientes', 'categorias', 'usuarios'
+            ];
+            for (const t of oldTables)
+                db.run(`ALTER TABLE ${t} RENAME TO equioriente_${t}`, () => {});
+            run(`CREATE TABLE IF NOT EXISTS equioriente_usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario TEXT UNIQUE, password TEXT, rol TEXT)`);
+            run(`CREATE TABLE IF NOT EXISTS equioriente_clientes (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT NOT NULL, telefono TEXT, direccion TEXT, identificacion TEXT UNIQUE)`);
+            run(`CREATE TABLE IF NOT EXISTS equioriente_categorias (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT UNIQUE)`);
+            run(`CREATE TABLE IF NOT EXISTS equioriente_articulos (id INTEGER PRIMARY KEY AUTOINCREMENT, referencia TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, stock_total INTEGER NOT NULL DEFAULT 0, stock_disponible INTEGER NOT NULL DEFAULT 0, stock_mantenimiento INTEGER NOT NULL DEFAULT 0, stock_danado INTEGER NOT NULL DEFAULT 0, stock_minimo INTEGER NOT NULL DEFAULT 0, precio_dia REAL NOT NULL DEFAULT 0, es_externo INTEGER NOT NULL DEFAULT 0, empresa_externa TEXT, costo_proveedor_dia REAL DEFAULT 0, categoria_id INTEGER, FOREIGN KEY(categoria_id) REFERENCES equioriente_categorias(id))`);
+            run(`CREATE TABLE IF NOT EXISTS equioriente_alquileres (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER NOT NULL, usuario_id INTEGER NOT NULL, fecha_salida TEXT DEFAULT CURRENT_TIMESTAMP, fecha_devolucion_esperada TEXT, fecha_devolucion_real TEXT, estado TEXT DEFAULT 'activo', notas TEXT, FOREIGN KEY(cliente_id) REFERENCES equioriente_clientes(id), FOREIGN KEY(usuario_id) REFERENCES equioriente_usuarios(id))`);
+            run(`CREATE TABLE IF NOT EXISTS equioriente_alquiler_items (id INTEGER PRIMARY KEY AUTOINCREMENT, alquiler_id INTEGER NOT NULL, articulo_id INTEGER NOT NULL, cantidad INTEGER NOT NULL, cantidad_devuelta INTEGER NOT NULL DEFAULT 0, precio_dia_aplicado REAL NOT NULL, dias_acordados INTEGER NOT NULL DEFAULT 1, dias_reales INTEGER, total_calculado REAL, FOREIGN KEY(alquiler_id) REFERENCES equioriente_alquileres(id), FOREIGN KEY(articulo_id) REFERENCES equioriente_articulos(id))`);
+            run(`CREATE TABLE IF NOT EXISTS equioriente_devoluciones_proveedor (id INTEGER PRIMARY KEY AUTOINCREMENT, articulo_id INTEGER NOT NULL, cantidad INTEGER NOT NULL, fecha_retiro TEXT, fecha_devolucion TEXT DEFAULT CURRENT_TIMESTAMP, dias_reales INTEGER, costo_proveedor_dia REAL, total_costo REAL, notas TEXT, usuario_id INTEGER, FOREIGN KEY(articulo_id) REFERENCES equioriente_articulos(id), FOREIGN KEY(usuario_id) REFERENCES equioriente_usuarios(id))`);
+            run(`CREATE TABLE IF NOT EXISTS equioriente_movimientos_inventario (id INTEGER PRIMARY KEY AUTOINCREMENT, articulo_id INTEGER NOT NULL, tipo TEXT NOT NULL, cantidad INTEGER NOT NULL, motivo TEXT, referencia_id INTEGER, usuario_id INTEGER, fecha TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(articulo_id) REFERENCES equioriente_articulos(id), FOREIGN KEY(usuario_id) REFERENCES equioriente_usuarios(id))`);
+            run(`CREATE TABLE IF NOT EXISTS equioriente_registro_danos (id INTEGER PRIMARY KEY AUTOINCREMENT, articulo_id INTEGER NOT NULL, alquiler_id INTEGER, cliente_id INTEGER, cantidad INTEGER NOT NULL DEFAULT 1, tipo TEXT NOT NULL DEFAULT 'dano', descripcion TEXT, costo_reparacion REAL DEFAULT 0, cobrado_cliente INTEGER DEFAULT 0, monto_cobrado REAL DEFAULT 0, estado TEXT DEFAULT 'pendiente', usuario_id INTEGER, fecha TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(articulo_id) REFERENCES equioriente_articulos(id), FOREIGN KEY(alquiler_id) REFERENCES equioriente_alquileres(id), FOREIGN KEY(cliente_id) REFERENCES equioriente_clientes(id), FOREIGN KEY(usuario_id) REFERENCES equioriente_usuarios(id))`);
+            // Migrations for older DBs
+            db.run(`ALTER TABLE equioriente_articulos ADD COLUMN stock_mantenimiento INTEGER NOT NULL DEFAULT 0`, () => {});
+            db.run(`ALTER TABLE equioriente_articulos ADD COLUMN stock_danado INTEGER NOT NULL DEFAULT 0`, () => {});
+            db.run(`ALTER TABLE equioriente_articulos ADD COLUMN stock_minimo INTEGER NOT NULL DEFAULT 0`, () => {});
+            db.run(`ALTER TABLE equioriente_alquiler_items ADD COLUMN cantidad_devuelta INTEGER NOT NULL DEFAULT 0`, () => {});
+            // Default seed
+            db.run(`INSERT OR IGNORE INTO equioriente_usuarios (usuario, password, rol) VALUES ('admin', '1234', 'admin')`);
+            db.run(`INSERT OR IGNORE INTO equioriente_usuarios (usuario, password, rol) VALUES ('operario', '1234', 'operario')`);
+            db.run(`INSERT OR IGNORE INTO equioriente_categorias (nombre) VALUES ('General')`, () => resolve());
+        }));
+        // Migrate plaintext passwords to bcrypt
+        const users = await dbAll("SELECT id, password FROM equioriente_usuarios");
+        for (const u of users) {
+            if (!u.password.startsWith("$2b$") && !u.password.startsWith("$2a$")) {
+                const hash = bcrypt.hashSync(u.password, SALT_ROUNDS);
+                await dbRun("UPDATE equioriente_usuarios SET password=? WHERE id=?", [hash, u.id]);
+            }
         }
-    });
+    }
+}
 
-    // Insert default users if they don't exist (will be hashed by migration above)
-    db.run(`INSERT OR IGNORE INTO usuarios (usuario, password, rol) VALUES ('admin', '1234', 'admin')`);
-    db.run(`INSERT OR IGNORE INTO usuarios (usuario, password, rol) VALUES ('operario', '1234', 'operario')`);
-    db.run(`INSERT OR IGNORE INTO categorias (nombre) VALUES ('General')`);
-});
+initDB().catch(e => console.error("Error initDB:", e.message));
 
 // ── Helper: log inventory movement ──────────────────
 async function logMovimiento(articulo_id, tipo, cantidad, motivo, referencia_id, usuario_id) {
     await dbRun(
-        `INSERT INTO movimientos_inventario (articulo_id, tipo, cantidad, motivo, referencia_id, usuario_id) VALUES (?,?,?,?,?,?)`,
+        `INSERT INTO equioriente_movimientos_inventario (articulo_id, tipo, cantidad, motivo, referencia_id, usuario_id) VALUES (?,?,?,?,?,?)`,
         [articulo_id, tipo, cantidad, motivo, referencia_id || null, usuario_id || null]
     );
 }
@@ -205,7 +241,7 @@ function adminOnly(req, res, next) {
 app.post("/login", async (req, res) => {
     try {
         const { usuario, password } = req.body;
-        const user = await dbGet("SELECT id, rol, usuario, password as hash FROM usuarios WHERE usuario = ?", [usuario]);
+        const user = await dbGet("SELECT id, rol, usuario, password as hash FROM equioriente_usuarios WHERE usuario = ?", [usuario]);
         if (!user) return res.status(401).json({ error: "Credenciales incorrectas" });
 
         const valid = await bcrypt.compare(password, user.hash);
@@ -222,11 +258,11 @@ app.post("/login", async (req, res) => {
 app.put("/usuarios/password", authMiddleware, async (req, res) => {
     try {
         const { password_actual, password_nuevo } = req.body;
-        const user = await dbGet("SELECT password FROM usuarios WHERE id=?", [req.user.id]);
+        const user = await dbGet("SELECT password FROM equioriente_usuarios WHERE id=?", [req.user.id]);
         const valid = await bcrypt.compare(password_actual, user.password);
         if (!valid) return res.status(400).json({ error: "Contraseña actual incorrecta" });
         const hash = await bcrypt.hash(password_nuevo, SALT_ROUNDS);
-        await dbRun("UPDATE usuarios SET password=? WHERE id=?", [hash, req.user.id]);
+        await dbRun("UPDATE equioriente_usuarios SET password=? WHERE id=?", [hash, req.user.id]);
         res.json({ msg: "Contraseña actualizada" });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -234,77 +270,78 @@ app.put("/usuarios/password", authMiddleware, async (req, res) => {
 });
 
 // ── CATEGORIAS ────────────────────────────────────────
-app.get("/categorias", authMiddleware, (req, res) => {
-    db.all("SELECT * FROM categorias ORDER BY nombre", [], (err, rows) => res.json(rows || []));
+app.get("/categorias", authMiddleware, async (req, res) => {
+    try { res.json(await dbAll("SELECT * FROM equioriente_categorias ORDER BY nombre")); }
+    catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/categorias", authMiddleware, (req, res) => {
-    db.run("INSERT INTO categorias (nombre) VALUES (?)", [req.body.nombre], function(err) {
-        if (err) return res.status(500).send(err.message);
-        res.json({ id: this.lastID, nombre: req.body.nombre });
-    });
+app.post("/categorias", authMiddleware, async (req, res) => {
+    try {
+        const r = await dbRun("INSERT INTO equioriente_categorias (nombre) VALUES (?)", [req.body.nombre]);
+        res.json({ id: r.lastID, nombre: req.body.nombre });
+    } catch (e) { res.status(500).send(e.message); }
 });
 
 // ── CLIENTES ──────────────────────────────────────────
-app.get("/clientes", authMiddleware, (req, res) => {
-    const { buscar } = req.query;
-    let sql = "SELECT * FROM clientes";
-    const params = [];
-    if (buscar) {
-        sql += " WHERE nombre LIKE ? OR identificacion LIKE ? OR telefono LIKE ?";
-        const term = `%${buscar}%`;
-        params.push(term, term, term);
-    }
-    sql += " ORDER BY nombre";
-    db.all(sql, params, (err, rows) => res.json(rows || []));
+app.get("/clientes", authMiddleware, async (req, res) => {
+    try {
+        const { buscar } = req.query;
+        let sql = "SELECT * FROM equioriente_clientes";
+        const params = [];
+        if (buscar) {
+            sql += " WHERE nombre LIKE ? OR identificacion LIKE ? OR telefono LIKE ?";
+            const term = `%${buscar}%`;
+            params.push(term, term, term);
+        }
+        res.json(await dbAll(sql + " ORDER BY nombre", params));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/clientes", authMiddleware, (req, res) => {
-    const { nombre, telefono, direccion, identificacion } = req.body;
-    db.run("INSERT INTO clientes (nombre, telefono, direccion, identificacion) VALUES (?,?,?,?)",
-        [nombre, telefono, direccion, identificacion], function(err) {
-            if (err) return res.status(500).send("Error: identificacion duplicada o datos invalidos.");
-            res.json({ id: this.lastID, nombre });
-        });
+app.post("/clientes", authMiddleware, async (req, res) => {
+    try {
+        const { nombre, telefono, direccion, identificacion } = req.body;
+        const r = await dbRun(
+            "INSERT INTO equioriente_clientes (nombre, telefono, direccion, identificacion) VALUES (?,?,?,?)",
+            [nombre, telefono, direccion, identificacion]);
+        res.json({ id: r.lastID, nombre });
+    } catch (e) { res.status(500).send("Error: identificacion duplicada o datos invalidos."); }
 });
-app.put("/clientes/:id", authMiddleware, (req, res) => {
-    const { nombre, telefono, direccion, identificacion } = req.body;
-    db.run("UPDATE clientes SET nombre=?, telefono=?, direccion=?, identificacion=? WHERE id=?",
-        [nombre, telefono, direccion, identificacion, req.params.id], (err) => {
-            if (err) return res.status(500).send(err.message);
-            res.json({ msg: "Actualizado" });
-        });
+app.put("/clientes/:id", authMiddleware, async (req, res) => {
+    try {
+        const { nombre, telefono, direccion, identificacion } = req.body;
+        await dbRun("UPDATE equioriente_clientes SET nombre=?, telefono=?, direccion=?, identificacion=? WHERE id=?",
+            [nombre, telefono, direccion, identificacion, req.params.id]);
+        res.json({ msg: "Actualizado" });
+    } catch (e) { res.status(500).send(e.message); }
 });
-app.delete("/clientes/:id", authMiddleware, (req, res) => {
-    db.run("DELETE FROM clientes WHERE id=?", [req.params.id], (err) => {
-        if (err) return res.status(500).send(err.message);
+app.delete("/clientes/:id", authMiddleware, async (req, res) => {
+    try {
+        await dbRun("DELETE FROM equioriente_clientes WHERE id=?", [req.params.id]);
         res.json({ msg: "Eliminado" });
-    });
+    } catch (e) { res.status(500).send(e.message); }
 });
 
 // ── ARTICULOS ─────────────────────────────────────────
-app.get("/articulos", authMiddleware, (req, res) => {
-    const { buscar, categoria_id } = req.query;
-    let sql = `SELECT a.*, c.nombre as categoria_nombre
-               FROM articulos a LEFT JOIN categorias c ON a.categoria_id = c.id WHERE 1=1`;
-    const params = [];
-    if (buscar) {
-        sql += " AND (a.nombre LIKE ? OR a.referencia LIKE ?)";
-        const term = `%${buscar}%`;
-        params.push(term, term);
-    }
-    if (categoria_id) {
-        sql += " AND a.categoria_id = ?";
-        params.push(categoria_id);
-    }
-    sql += " ORDER BY a.nombre";
-    db.all(sql, params, (err, rows) => res.json(rows || []));
+app.get("/articulos", authMiddleware, async (req, res) => {
+    try {
+        const { buscar, categoria_id } = req.query;
+        let sql = `SELECT a.*, c.nombre as categoria_nombre
+                   FROM equioriente_articulos a LEFT JOIN equioriente_categorias c ON a.categoria_id = c.id WHERE 1=1`;
+        const params = [];
+        if (buscar) {
+            sql += " AND (a.nombre LIKE ? OR a.referencia LIKE ?)";
+            params.push(`%${buscar}%`, `%${buscar}%`);
+        }
+        if (categoria_id) { sql += " AND a.categoria_id = ?"; params.push(categoria_id); }
+        res.json(await dbAll(sql + " ORDER BY a.nombre", params));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Stock alerts
-app.get("/articulos/alertas", authMiddleware, (req, res) => {
-    db.all(`SELECT a.*, c.nombre as categoria_nombre
-            FROM articulos a LEFT JOIN categorias c ON a.categoria_id = c.id
+app.get("/articulos/alertas", authMiddleware, async (req, res) => {
+    try {
+        res.json(await dbAll(`SELECT a.*, c.nombre as categoria_nombre
+            FROM equioriente_articulos a LEFT JOIN equioriente_categorias c ON a.categoria_id = c.id
             WHERE a.stock_disponible <= a.stock_minimo AND a.stock_minimo > 0
-            ORDER BY a.stock_disponible ASC`, [], (err, rows) => res.json(rows || []));
+            ORDER BY a.stock_disponible ASC`));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/articulos", authMiddleware, async (req, res) => {
@@ -312,10 +349,10 @@ app.post("/articulos", authMiddleware, async (req, res) => {
         const { referencia, nombre, stock_total, precio_dia, es_externo, empresa_externa, costo_proveedor_dia, categoria_id, stock_minimo } = req.body;
         const stockInt = parseInt(stock_total) || 0;
         const result = await dbRun(
-            `INSERT INTO articulos (referencia, nombre, stock_total, stock_disponible, precio_dia, es_externo, empresa_externa, costo_proveedor_dia, categoria_id, stock_minimo)
+            `INSERT INTO equioriente_articulos (referencia, nombre, stock_total, stock_disponible, precio_dia, es_externo, empresa_externa, costo_proveedor_dia, categoria_id, stock_minimo)
              VALUES (?,?,?,?,?,?,?,?,?,?)`,
             [referencia.toUpperCase(), nombre, stockInt, stockInt,
-             precio_dia, es_externo ? 1 : 0, empresa_externa || null,
+             precio_dia, parseInt(es_externo) === 1 ? 1 : 0, empresa_externa || null,
              costo_proveedor_dia || 0, categoria_id, stock_minimo || 0]);
         await logMovimiento(result.lastID, "entrada", stockInt, "Creacion de articulo", null, req.user.id);
         res.json({ id: result.lastID });
@@ -327,17 +364,17 @@ app.post("/articulos", authMiddleware, async (req, res) => {
 app.put("/articulos/:id", authMiddleware, async (req, res) => {
     try {
         const { nombre, stock_total, precio_dia, empresa_externa, costo_proveedor_dia, stock_minimo } = req.body;
-        const old = await dbGet("SELECT stock_total FROM articulos WHERE id=?", [req.params.id]);
-        await dbRun("UPDATE articulos SET nombre=?, stock_total=?, precio_dia=?, empresa_externa=?, costo_proveedor_dia=?, stock_minimo=? WHERE id=?",
+        const old = await dbGet("SELECT stock_total FROM equioriente_articulos WHERE id=?", [req.params.id]);
+        await dbRun("UPDATE equioriente_articulos SET nombre=?, stock_total=?, precio_dia=?, empresa_externa=?, costo_proveedor_dia=?, stock_minimo=? WHERE id=?",
             [nombre, stock_total, precio_dia, empresa_externa || null, costo_proveedor_dia || 0, stock_minimo || 0, req.params.id]);
 
         if (old && stock_total !== old.stock_total) {
             const diff = stock_total - old.stock_total;
             if (diff > 0) {
-                await dbRun("UPDATE articulos SET stock_disponible = stock_disponible + ? WHERE id=?", [diff, req.params.id]);
+                await dbRun("UPDATE equioriente_articulos SET stock_disponible = stock_disponible + ? WHERE id=?", [diff, req.params.id]);
                 await logMovimiento(req.params.id, "entrada", diff, "Ajuste manual de stock", null, req.user.id);
             } else if (diff < 0) {
-                await dbRun("UPDATE articulos SET stock_disponible = MAX(0, stock_disponible + ?) WHERE id=?", [diff, req.params.id]);
+                await dbRun("UPDATE equioriente_articulos SET stock_disponible = MAX(0, stock_disponible + ?) WHERE id=?", [diff, req.params.id]);
                 await logMovimiento(req.params.id, "salida", Math.abs(diff), "Ajuste manual de stock", null, req.user.id);
             }
         }
@@ -347,31 +384,30 @@ app.put("/articulos/:id", authMiddleware, async (req, res) => {
     }
 });
 
-app.delete("/articulos/:id", authMiddleware, (req, res) => {
-    db.run("DELETE FROM articulos WHERE id=?", [req.params.id], (err) => {
-        if (err) return res.status(500).send(err.message);
+app.delete("/articulos/:id", authMiddleware, async (req, res) => {
+    try {
+        await dbRun("DELETE FROM equioriente_articulos WHERE id=?", [req.params.id]);
         res.json({ msg: "Eliminado" });
-    });
+    } catch (e) { res.status(500).send(e.message); }
 });
 
 // ── MOVIMIENTOS DE INVENTARIO ────────────────────────
-app.get("/movimientos", authMiddleware, (req, res) => {
-    const { articulo_id, limit } = req.query;
-    let sql = `SELECT m.*, a.nombre as articulo_nombre, a.referencia, u.usuario as operario
-               FROM movimientos_inventario m
-               JOIN articulos a ON m.articulo_id = a.id
-               LEFT JOIN usuarios u ON m.usuario_id = u.id`;
-    const params = [];
-    if (articulo_id) {
-        sql += " WHERE m.articulo_id = ?";
-        params.push(articulo_id);
-    }
-    sql += " ORDER BY m.id DESC";
-    if (limit) { sql += " LIMIT ?"; params.push(parseInt(limit)); }
-    db.all(sql, params, (err, rows) => res.json(rows || []));
+app.get("/movimientos", authMiddleware, async (req, res) => {
+    try {
+        const { articulo_id, limit } = req.query;
+        let sql = `SELECT m.*, a.nombre as articulo_nombre, a.referencia, u.usuario as operario
+                   FROM equioriente_movimientos_inventario m
+                   JOIN equioriente_articulos a ON m.articulo_id = a.id
+                   LEFT JOIN equioriente_usuarios u ON m.usuario_id = u.id`;
+        const params = [];
+        if (articulo_id) { sql += " WHERE m.articulo_id = ?"; params.push(articulo_id); }
+        sql += " ORDER BY m.id DESC";
+        if (limit) { sql += " LIMIT ?"; params.push(parseInt(limit)); }
+        res.json(await dbAll(sql, params));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── ALQUILERES (a clientes) ───────────────────────────
+// ── ALQUILERES (a equioriente_clientes) ───────────────────────────
 app.post("/alquileres", authMiddleware, async (req, res) => {
     try {
         const { cliente_id, usuario_id, fecha_devolucion_esperada, notas, items } = req.body;
@@ -379,22 +415,22 @@ app.post("/alquileres", authMiddleware, async (req, res) => {
 
         // Verify stock for all items first
         for (const item of items) {
-            const art = await dbGet("SELECT stock_disponible, nombre FROM articulos WHERE id=?", [item.articulo_id]);
+            const art = await dbGet("SELECT stock_disponible, nombre FROM equioriente_articulos WHERE id=?", [item.articulo_id]);
             if (!art || art.stock_disponible < item.cantidad) {
                 return res.status(400).send(`Stock insuficiente para ${art ? art.nombre : 'articulo ID ' + item.articulo_id}`);
             }
         }
 
         const result = await dbRun(
-            `INSERT INTO alquileres (cliente_id, usuario_id, fecha_devolucion_esperada, notas) VALUES (?,?,?,?)`,
+            `INSERT INTO equioriente_alquileres (cliente_id, usuario_id, fecha_devolucion_esperada, notas) VALUES (?,?,?,?)`,
             [cliente_id, usuario_id || req.user.id, fecha_devolucion_esperada, notas || null]);
         const alqId = result.lastID;
 
         for (const item of items) {
             await dbRun(
-                `INSERT INTO alquiler_items (alquiler_id, articulo_id, cantidad, precio_dia_aplicado, dias_acordados) VALUES (?,?,?,?,?)`,
+                `INSERT INTO equioriente_alquiler_items (alquiler_id, articulo_id, cantidad, precio_dia_aplicado, dias_acordados) VALUES (?,?,?,?,?)`,
                 [alqId, item.articulo_id, item.cantidad, item.precio_dia_aplicado, item.dias_acordados]);
-            await dbRun("UPDATE articulos SET stock_disponible = stock_disponible - ? WHERE id=?",
+            await dbRun("UPDATE equioriente_articulos SET stock_disponible = stock_disponible - ? WHERE id=?",
                 [item.cantidad, item.articulo_id]);
             await logMovimiento(item.articulo_id, "salida", item.cantidad, "Alquiler #" + alqId, alqId, req.user.id);
         }
@@ -405,32 +441,31 @@ app.post("/alquileres", authMiddleware, async (req, res) => {
     }
 });
 
-app.get("/alquileres", authMiddleware, (req, res) => {
-    const { estado, buscar } = req.query;
-    let sql = `
-        SELECT al.*, c.nombre as cliente_nombre, c.identificacion as cliente_id_doc,
-               c.telefono as cliente_tel, u.usuario as operario
-        FROM alquileres al
-        JOIN clientes c ON al.cliente_id = c.id
-        JOIN usuarios u ON al.usuario_id = u.id
-        WHERE 1=1
-    `;
-    const params = [];
-    if (estado) { sql += " AND al.estado = ?"; params.push(estado); }
-    if (buscar) {
-        sql += " AND (c.nombre LIKE ? OR c.identificacion LIKE ? OR CAST(al.id AS TEXT) LIKE ?)";
-        const term = `%${buscar}%`;
-        params.push(term, term, term);
-    }
-    sql += " ORDER BY al.id DESC";
-    db.all(sql, params, (err, rows) => res.json(rows || []));
+app.get("/alquileres", authMiddleware, async (req, res) => {
+    try {
+        const { estado, buscar } = req.query;
+        let sql = `SELECT al.*, c.nombre as cliente_nombre, c.identificacion as cliente_id_doc,
+                          c.telefono as cliente_tel, u.usuario as operario
+                   FROM equioriente_alquileres al
+                   JOIN equioriente_clientes c ON al.cliente_id = c.id
+                   JOIN equioriente_usuarios u ON al.usuario_id = u.id WHERE 1=1`;
+        const params = [];
+        if (estado) { sql += " AND al.estado = ?"; params.push(estado); }
+        if (buscar) {
+            sql += " AND (c.nombre LIKE ? OR c.identificacion LIKE ? OR CAST(al.id AS TEXT) LIKE ?)";
+            params.push(`%${buscar}%`, `%${buscar}%`, `%${buscar}%`);
+        }
+        res.json(await dbAll(sql + " ORDER BY al.id DESC", params));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/alquileres/:id/items", authMiddleware, (req, res) => {
-    db.all(`SELECT ai.*, a.nombre, a.referencia, a.es_externo, a.empresa_externa
-            FROM alquiler_items ai
-            JOIN articulos a ON ai.articulo_id = a.id
-            WHERE ai.alquiler_id = ?`, [req.params.id], (err, rows) => res.json(rows || []));
+app.get("/alquileres/:id/items", authMiddleware, async (req, res) => {
+    try {
+        res.json(await dbAll(
+            `SELECT ai.*, a.nombre, a.referencia, a.es_externo, a.empresa_externa
+             FROM equioriente_alquiler_items ai JOIN equioriente_articulos a ON ai.articulo_id = a.id
+             WHERE ai.alquiler_id = ?`, [req.params.id]));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── DEVOLUCION PARCIAL ───────────────────────────────
@@ -440,7 +475,7 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
         const { items_devueltos } = req.body;
         // items_devueltos: [{ item_id, cantidad_devolver }] — optional, if not provided returns ALL
 
-        const alq = await dbGet("SELECT fecha_salida, estado FROM alquileres WHERE id=?", [alqId]);
+        const alq = await dbGet("SELECT fecha_salida, estado FROM equioriente_alquileres WHERE id=?", [alqId]);
         if (!alq) return res.status(404).send("Alquiler no encontrado");
         if (alq.estado === "devuelto") return res.status(400).send("Este alquiler ya fue devuelto completamente");
 
@@ -448,7 +483,7 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
         const salida = new Date(alq.fecha_salida);
         const diasReales = Math.max(1, Math.ceil((ahora - salida) / (1000 * 60 * 60 * 24)));
 
-        const allItems = await dbAll("SELECT * FROM alquiler_items WHERE alquiler_id=?", [alqId]);
+        const allItems = await dbAll("SELECT * FROM equioriente_alquiler_items WHERE alquiler_id=?", [alqId]);
 
         if (items_devueltos && items_devueltos.length > 0) {
             // Partial return
@@ -462,9 +497,9 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
                 const newDevuelta = item.cantidad_devuelta + cantDev;
                 const total = item.precio_dia_aplicado * diasReales * newDevuelta;
 
-                await dbRun("UPDATE alquiler_items SET cantidad_devuelta=?, dias_reales=?, total_calculado=? WHERE id=?",
+                await dbRun("UPDATE equioriente_alquiler_items SET cantidad_devuelta=?, dias_reales=?, total_calculado=? WHERE id=?",
                     [newDevuelta, diasReales, total, item.id]);
-                await dbRun("UPDATE articulos SET stock_disponible = stock_disponible + ? WHERE id=?",
+                await dbRun("UPDATE equioriente_articulos SET stock_disponible = stock_disponible + ? WHERE id=?",
                     [cantDev, item.articulo_id]);
                 await logMovimiento(item.articulo_id, "entrada", cantDev, "Devolucion parcial alquiler #" + alqId, alqId, req.user.id);
             }
@@ -474,21 +509,21 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
                 const pendiente = item.cantidad - item.cantidad_devuelta;
                 if (pendiente <= 0) continue;
                 const total = item.precio_dia_aplicado * diasReales * item.cantidad;
-                await dbRun("UPDATE alquiler_items SET cantidad_devuelta=?, dias_reales=?, total_calculado=? WHERE id=?",
+                await dbRun("UPDATE equioriente_alquiler_items SET cantidad_devuelta=?, dias_reales=?, total_calculado=? WHERE id=?",
                     [item.cantidad, diasReales, total, item.id]);
-                await dbRun("UPDATE articulos SET stock_disponible = stock_disponible + ? WHERE id=?",
+                await dbRun("UPDATE equioriente_articulos SET stock_disponible = stock_disponible + ? WHERE id=?",
                     [pendiente, item.articulo_id]);
                 await logMovimiento(item.articulo_id, "entrada", pendiente, "Devolucion alquiler #" + alqId, alqId, req.user.id);
             }
         }
 
         // Check if all items fully returned
-        const updated = await dbAll("SELECT cantidad, cantidad_devuelta FROM alquiler_items WHERE alquiler_id=?", [alqId]);
+        const updated = await dbAll("SELECT cantidad, cantidad_devuelta FROM equioriente_alquiler_items WHERE alquiler_id=?", [alqId]);
         const allReturned = updated.every(i => i.cantidad_devuelta >= i.cantidad);
         if (allReturned) {
-            await dbRun("UPDATE alquileres SET estado='devuelto', fecha_devolucion_real=CURRENT_TIMESTAMP WHERE id=?", [alqId]);
+            await dbRun("UPDATE equioriente_alquileres SET estado='devuelto', fecha_devolucion_real=CURRENT_TIMESTAMP WHERE id=?", [alqId]);
         } else {
-            await dbRun("UPDATE alquileres SET estado='parcial' WHERE id=?", [alqId]);
+            await dbRun("UPDATE equioriente_alquileres SET estado='parcial' WHERE id=?", [alqId]);
         }
 
         res.json({ msg: allReturned ? "Devuelto completamente" : "Devolucion parcial registrada", diasReales });
@@ -504,19 +539,19 @@ app.post("/danos", authMiddleware, async (req, res) => {
         if (!articulo_id || !cantidad) return res.status(400).send("Datos incompletos");
 
         const result = await dbRun(
-            `INSERT INTO registro_danos (articulo_id, alquiler_id, cliente_id, cantidad, tipo, descripcion, costo_reparacion, cobrado_cliente, monto_cobrado, usuario_id)
+            `INSERT INTO equioriente_registro_danos (articulo_id, alquiler_id, cliente_id, cantidad, tipo, descripcion, costo_reparacion, cobrado_cliente, monto_cobrado, usuario_id)
              VALUES (?,?,?,?,?,?,?,?,?,?)`,
             [articulo_id, alquiler_id || null, cliente_id || null, cantidad,
              tipo || "dano", descripcion || null, costo_reparacion || 0,
              cobrado_cliente ? 1 : 0, monto_cobrado || 0, req.user.id]);
 
         if (tipo === "perdida") {
-            await dbRun("UPDATE articulos SET stock_total = stock_total - ?, stock_disponible = MAX(0, stock_disponible - ?) WHERE id=?",
+            await dbRun("UPDATE equioriente_articulos SET stock_total = stock_total - ?, stock_disponible = MAX(0, stock_disponible - ?) WHERE id=?",
                 [cantidad, cantidad, articulo_id]);
             await logMovimiento(articulo_id, "perdida", cantidad, descripcion || "Perdida registrada", alquiler_id, req.user.id);
         } else {
             // Damage: move from available to damaged
-            await dbRun("UPDATE articulos SET stock_disponible = MAX(0, stock_disponible - ?), stock_danado = stock_danado + ? WHERE id=?",
+            await dbRun("UPDATE equioriente_articulos SET stock_disponible = MAX(0, stock_disponible - ?), stock_danado = stock_danado + ? WHERE id=?",
                 [cantidad, cantidad, articulo_id]);
             await logMovimiento(articulo_id, "dano", cantidad, descripcion || "Dano registrado", alquiler_id, req.user.id);
         }
@@ -530,11 +565,11 @@ app.post("/danos", authMiddleware, async (req, res) => {
 // Repair: move from damaged back to available
 app.put("/danos/:id/reparar", authMiddleware, async (req, res) => {
     try {
-        const dano = await dbGet("SELECT * FROM registro_danos WHERE id=?", [req.params.id]);
+        const dano = await dbGet("SELECT * FROM equioriente_registro_danos WHERE id=?", [req.params.id]);
         if (!dano) return res.status(404).send("Registro no encontrado");
 
-        await dbRun("UPDATE registro_danos SET estado='reparado' WHERE id=?", [req.params.id]);
-        await dbRun("UPDATE articulos SET stock_danado = MAX(0, stock_danado - ?), stock_disponible = stock_disponible + ? WHERE id=?",
+        await dbRun("UPDATE equioriente_registro_danos SET estado='reparado' WHERE id=?", [req.params.id]);
+        await dbRun("UPDATE equioriente_articulos SET stock_danado = MAX(0, stock_danado - ?), stock_disponible = stock_disponible + ? WHERE id=?",
             [dano.cantidad, dano.cantidad, dano.articulo_id]);
         await logMovimiento(dano.articulo_id, "reparacion", dano.cantidad, "Reparacion completada", null, req.user.id);
         res.json({ msg: "Articulo reparado y devuelto al inventario" });
@@ -543,18 +578,19 @@ app.put("/danos/:id/reparar", authMiddleware, async (req, res) => {
     }
 });
 
-app.get("/danos", authMiddleware, (req, res) => {
-    const { estado } = req.query;
-    let sql = `SELECT d.*, a.nombre as articulo_nombre, a.referencia,
-                      c.nombre as cliente_nombre, u.usuario as operario
-               FROM registro_danos d
-               JOIN articulos a ON d.articulo_id = a.id
-               LEFT JOIN clientes c ON d.cliente_id = c.id
-               LEFT JOIN usuarios u ON d.usuario_id = u.id`;
-    const params = [];
-    if (estado) { sql += " WHERE d.estado = ?"; params.push(estado); }
-    sql += " ORDER BY d.id DESC";
-    db.all(sql, params, (err, rows) => res.json(rows || []));
+app.get("/danos", authMiddleware, async (req, res) => {
+    try {
+        const { estado } = req.query;
+        let sql = `SELECT d.*, a.nombre as articulo_nombre, a.referencia,
+                          c.nombre as cliente_nombre, u.usuario as operario
+                   FROM equioriente_registro_danos d
+                   JOIN equioriente_articulos a ON d.articulo_id = a.id
+                   LEFT JOIN equioriente_clientes c ON d.cliente_id = c.id
+                   LEFT JOIN equioriente_usuarios u ON d.usuario_id = u.id`;
+        const params = [];
+        if (estado) { sql += " WHERE d.estado = ?"; params.push(estado); }
+        res.json(await dbAll(sql + " ORDER BY d.id DESC", params));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── DEVOLUCIONES A PROVEEDOR ──────────────────────────
@@ -563,7 +599,7 @@ app.post("/devoluciones_proveedor", authMiddleware, async (req, res) => {
         const { articulo_id, cantidad, fecha_retiro, costo_proveedor_dia, notas } = req.body;
         if (!articulo_id || !cantidad) return res.status(400).send("Datos incompletos");
 
-        const art = await dbGet("SELECT * FROM articulos WHERE id=?", [articulo_id]);
+        const art = await dbGet("SELECT * FROM equioriente_articulos WHERE id=?", [articulo_id]);
         if (!art) return res.status(404).send("Articulo no encontrado");
         if (art.stock_disponible < cantidad)
             return res.status(400).send(`Solo hay ${art.stock_disponible} unidades disponibles para devolver`);
@@ -575,15 +611,15 @@ app.post("/devoluciones_proveedor", authMiddleware, async (req, res) => {
         const totalCosto = costoDia * diasReales * cantidad;
 
         const result = await dbRun(
-            `INSERT INTO devoluciones_proveedor (articulo_id, cantidad, fecha_retiro, dias_reales, costo_proveedor_dia, total_costo, notas, usuario_id)
+            `INSERT INTO equioriente_devoluciones_proveedor (articulo_id, cantidad, fecha_retiro, dias_reales, costo_proveedor_dia, total_costo, notas, usuario_id)
              VALUES (?,?,?,?,?,?,?,?)`,
             [articulo_id, cantidad, fecha_retiro || null, diasReales, costoDia, totalCosto, notas || null, req.user.id]);
 
         const newTotal = art.stock_total - cantidad;
         if (newTotal <= 0) {
-            await dbRun("DELETE FROM articulos WHERE id=?", [articulo_id]);
+            await dbRun("DELETE FROM equioriente_articulos WHERE id=?", [articulo_id]);
         } else {
-            await dbRun("UPDATE articulos SET stock_disponible = stock_disponible - ?, stock_total = stock_total - ? WHERE id=?",
+            await dbRun("UPDATE equioriente_articulos SET stock_disponible = stock_disponible - ?, stock_total = stock_total - ? WHERE id=?",
                 [cantidad, cantidad, articulo_id]);
         }
         await logMovimiento(articulo_id, "devolucion_proveedor", cantidad, "Devolucion a proveedor", result.lastID, req.user.id);
@@ -594,12 +630,15 @@ app.post("/devoluciones_proveedor", authMiddleware, async (req, res) => {
     }
 });
 
-app.get("/devoluciones_proveedor", authMiddleware, (req, res) => {
-    db.all(`SELECT dp.*, a.nombre, a.referencia, a.empresa_externa, u.usuario as operario
-            FROM devoluciones_proveedor dp
-            JOIN articulos a ON dp.articulo_id = a.id
-            LEFT JOIN usuarios u ON dp.usuario_id = u.id
-            ORDER BY dp.id DESC`, [], (err, rows) => res.json(rows || []));
+app.get("/devoluciones_proveedor", authMiddleware, async (req, res) => {
+    try {
+        res.json(await dbAll(
+            `SELECT dp.*, a.nombre, a.referencia, a.empresa_externa, u.usuario as operario
+             FROM equioriente_devoluciones_proveedor dp
+             JOIN equioriente_articulos a ON dp.articulo_id = a.id
+             LEFT JOIN equioriente_usuarios u ON dp.usuario_id = u.id
+             ORDER BY dp.id DESC`));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── REPORTES ─────────────────────────────────────────
@@ -607,8 +646,8 @@ app.get("/reportes/articulos-top", authMiddleware, async (req, res) => {
     try {
         const rows = await dbAll(`
             SELECT a.nombre, a.referencia, SUM(ai.cantidad) as total_alquilado, COUNT(DISTINCT ai.alquiler_id) as veces_alquilado
-            FROM alquiler_items ai
-            JOIN articulos a ON ai.articulo_id = a.id
+            FROM equioriente_alquiler_items ai
+            JOIN equioriente_articulos a ON ai.articulo_id = a.id
             GROUP BY ai.articulo_id
             ORDER BY total_alquilado DESC
             LIMIT 20`);
@@ -623,8 +662,8 @@ app.get("/reportes/ingresos", authMiddleware, async (req, res) => {
             SELECT DATE(al.fecha_salida) as fecha,
                    SUM(ai.total_calculado) as ingreso_total,
                    COUNT(DISTINCT al.id) as total_alquileres
-            FROM alquileres al
-            JOIN alquiler_items ai ON al.id = ai.alquiler_id
+            FROM equioriente_alquileres al
+            JOIN equioriente_alquiler_items ai ON al.id = ai.alquiler_id
             WHERE al.estado = 'devuelto' AND ai.total_calculado IS NOT NULL`;
         const params = [];
         if (desde) { sql += " AND DATE(al.fecha_salida) >= ?"; params.push(desde); }
@@ -635,8 +674,8 @@ app.get("/reportes/ingresos", authMiddleware, async (req, res) => {
         const totales = await dbGet(`
             SELECT COALESCE(SUM(ai.total_calculado), 0) as ingreso_total,
                    COUNT(DISTINCT al.id) as total_alquileres
-            FROM alquileres al
-            JOIN alquiler_items ai ON al.id = ai.alquiler_id
+            FROM equioriente_alquileres al
+            JOIN equioriente_alquiler_items ai ON al.id = ai.alquiler_id
             WHERE al.estado = 'devuelto' AND ai.total_calculado IS NOT NULL
             ${desde ? "AND DATE(al.fecha_salida) >= ?" : ""}
             ${hasta ? "AND DATE(al.fecha_salida) <= ?" : ""}`,
@@ -652,9 +691,9 @@ app.get("/reportes/clientes-top", authMiddleware, async (req, res) => {
             SELECT c.nombre, c.identificacion, c.telefono,
                    COUNT(al.id) as total_alquileres,
                    COALESCE(SUM(ai.total_calculado), 0) as total_gastado
-            FROM clientes c
-            JOIN alquileres al ON c.id = al.cliente_id
-            LEFT JOIN alquiler_items ai ON al.id = ai.alquiler_id
+            FROM equioriente_clientes c
+            JOIN equioriente_alquileres al ON c.id = al.cliente_id
+            LEFT JOIN equioriente_alquiler_items ai ON al.id = ai.alquiler_id
             GROUP BY c.id
             ORDER BY total_alquileres DESC
             LIMIT 20`);
@@ -667,9 +706,9 @@ app.get("/reportes/costos-externos", authMiddleware, async (req, res) => {
         const rows = await dbAll(`
             SELECT a.nombre, a.referencia, a.empresa_externa,
                    COALESCE(SUM(dp.total_costo), 0) as costo_total_proveedor,
-                   COALESCE((SELECT SUM(ai2.total_calculado) FROM alquiler_items ai2 WHERE ai2.articulo_id = a.id), 0) as ingreso_generado
-            FROM articulos a
-            LEFT JOIN devoluciones_proveedor dp ON a.id = dp.articulo_id
+                   COALESCE((SELECT SUM(ai2.total_calculado) FROM equioriente_alquiler_items ai2 WHERE ai2.articulo_id = a.id), 0) as ingreso_generado
+            FROM equioriente_articulos a
+            LEFT JOIN equioriente_devoluciones_proveedor dp ON a.id = dp.articulo_id
             WHERE a.es_externo = 1
             GROUP BY a.id
             ORDER BY costo_total_proveedor DESC`);
@@ -683,8 +722,8 @@ app.get("/reportes/morosos", authMiddleware, async (req, res) => {
             SELECT al.id as alquiler_id, c.nombre, c.telefono, c.identificacion,
                    al.fecha_salida, al.fecha_devolucion_esperada,
                    CAST(julianday('now') - julianday(al.fecha_devolucion_esperada) AS INTEGER) as dias_retraso
-            FROM alquileres al
-            JOIN clientes c ON al.cliente_id = c.id
+            FROM equioriente_alquileres al
+            JOIN equioriente_clientes c ON al.cliente_id = c.id
             WHERE al.estado IN ('activo', 'parcial')
               AND al.fecha_devolucion_esperada IS NOT NULL
               AND DATE('now') > DATE(al.fecha_devolucion_esperada)
@@ -695,24 +734,17 @@ app.get("/reportes/morosos", authMiddleware, async (req, res) => {
 
 // ── BACKUP ───────────────────────────────────────────
 app.post("/backup", authMiddleware, adminOnly, (req, res) => {
+    if (pgPool) return res.json({ msg: "Supabase gestiona sus propios backups automaticos en la nube." });
     try {
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
         const backupFile = path.join(BACKUP_DIR, `rental_backup_${timestamp}.db`);
         fs.copyFileSync("rental.db", backupFile);
-
-        // Keep only the last 10 backups
         const backups = fs.readdirSync(BACKUP_DIR)
             .filter(f => f.startsWith("rental_backup_") && f.endsWith(".db"))
-            .sort()
-            .reverse();
-        backups.slice(10).forEach(f => {
-            try { fs.unlinkSync(path.join(BACKUP_DIR, f)); } catch(_) {}
-        });
-
+            .sort().reverse();
+        backups.slice(10).forEach(f => { try { fs.unlinkSync(path.join(BACKUP_DIR, f)); } catch(_) {} });
         res.json({ msg: "Backup creado", archivo: backupFile });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/backup/list", authMiddleware, adminOnly, (req, res) => {
@@ -731,8 +763,8 @@ app.get("/backup/list", authMiddleware, adminOnly, (req, res) => {
     }
 });
 
-// Auto-backup every 6 hours
-setInterval(() => {
+// Auto-backup every 6 hours (SQLite only)
+if (!pgPool) setInterval(() => {
     try {
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
         const backupFile = path.join(BACKUP_DIR, `rental_backup_${timestamp}.db`);
@@ -740,13 +772,9 @@ setInterval(() => {
         const backups = fs.readdirSync(BACKUP_DIR)
             .filter(f => f.startsWith("rental_backup_") && f.endsWith(".db"))
             .sort().reverse();
-        backups.slice(10).forEach(f => {
-            try { fs.unlinkSync(path.join(BACKUP_DIR, f)); } catch(_) {}
-        });
+        backups.slice(10).forEach(f => { try { fs.unlinkSync(path.join(BACKUP_DIR, f)); } catch(_) {} });
         console.log("Auto-backup creado:", backupFile);
-    } catch (e) {
-        console.error("Error en auto-backup:", e.message);
-    }
+    } catch (e) { console.error("Error en auto-backup:", e.message); }
 }, 6 * 60 * 60 * 1000);
 
 // ── ESTADÍSTICAS MENSUALES ────────────────────────────
@@ -756,9 +784,9 @@ app.get("/reportes/estadisticas", authMiddleware, async (req, res) => {
         const meses = await dbAll(`
             SELECT strftime('%Y-%m', al.fecha_salida) as mes,
                    COALESCE(SUM(ai.total_calculado), 0) as ingreso,
-                   COUNT(DISTINCT al.id) as alquileres
-            FROM alquileres al
-            JOIN alquiler_items ai ON al.id = ai.alquiler_id
+                   COUNT(DISTINCT al.id) as equioriente_alquileres
+            FROM equioriente_alquileres al
+            JOIN equioriente_alquiler_items ai ON al.id = ai.alquiler_id
             WHERE al.estado = 'devuelto' AND ai.total_calculado IS NOT NULL
               AND al.fecha_salida >= date('now', '-12 months')
             GROUP BY mes
@@ -767,29 +795,29 @@ app.get("/reportes/estadisticas", authMiddleware, async (req, res) => {
         // Current month totals
         const mesActual = await dbGet(`
             SELECT COALESCE(SUM(ai.total_calculado), 0) as ingreso,
-                   COUNT(DISTINCT al.id) as alquileres,
+                   COUNT(DISTINCT al.id) as equioriente_alquileres,
                    COALESCE(AVG(ai.total_calculado), 0) as promedio_item
-            FROM alquileres al
-            JOIN alquiler_items ai ON al.id = ai.alquiler_id
+            FROM equioriente_alquileres al
+            JOIN equioriente_alquiler_items ai ON al.id = ai.alquiler_id
             WHERE al.estado = 'devuelto' AND ai.total_calculado IS NOT NULL
               AND strftime('%Y-%m', al.fecha_salida) = strftime('%Y-%m', 'now')`);
 
         // Previous month totals
         const mesPasado = await dbGet(`
             SELECT COALESCE(SUM(ai.total_calculado), 0) as ingreso,
-                   COUNT(DISTINCT al.id) as alquileres
-            FROM alquileres al
-            JOIN alquiler_items ai ON al.id = ai.alquiler_id
+                   COUNT(DISTINCT al.id) as equioriente_alquileres
+            FROM equioriente_alquileres al
+            JOIN equioriente_alquiler_items ai ON al.id = ai.alquiler_id
             WHERE al.estado = 'devuelto' AND ai.total_calculado IS NOT NULL
               AND strftime('%Y-%m', al.fecha_salida) = strftime('%Y-%m', date('now', '-1 month'))`);
 
         // Top client this month
         const topCliente = await dbGet(`
-            SELECT c.nombre, COUNT(al.id) as alquileres,
+            SELECT c.nombre, COUNT(al.id) as equioriente_alquileres,
                    COALESCE(SUM(ai.total_calculado), 0) as total
-            FROM alquileres al
-            JOIN clientes c ON al.cliente_id = c.id
-            JOIN alquiler_items ai ON al.id = ai.alquiler_id
+            FROM equioriente_alquileres al
+            JOIN equioriente_clientes c ON al.cliente_id = c.id
+            JOIN equioriente_alquiler_items ai ON al.id = ai.alquiler_id
             WHERE al.estado = 'devuelto' AND ai.total_calculado IS NOT NULL
               AND strftime('%Y-%m', al.fecha_salida) = strftime('%Y-%m', 'now')
             GROUP BY c.id ORDER BY total DESC LIMIT 1`);
@@ -797,9 +825,9 @@ app.get("/reportes/estadisticas", authMiddleware, async (req, res) => {
         // Top article this month
         const topArticulo = await dbGet(`
             SELECT a.nombre, SUM(ai.cantidad) as total_cant
-            FROM alquiler_items ai
-            JOIN articulos a ON ai.articulo_id = a.id
-            JOIN alquileres al ON ai.alquiler_id = al.id
+            FROM equioriente_alquiler_items ai
+            JOIN equioriente_articulos a ON ai.articulo_id = a.id
+            JOIN equioriente_alquileres al ON ai.alquiler_id = al.id
             WHERE strftime('%Y-%m', al.fecha_salida) = strftime('%Y-%m', 'now')
             GROUP BY ai.articulo_id ORDER BY total_cant DESC LIMIT 1`);
 
@@ -809,37 +837,98 @@ app.get("/reportes/estadisticas", authMiddleware, async (req, res) => {
 
 // ── EXPORTAR XLSX ─────────────────────────────────────
 
+function xlsxStyleHeader(ws, row, bgColor = "1e3a5f") {
+    row.eachCell(cell => {
+        cell.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 11 };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF" + bgColor } };
+        cell.alignment = { horizontal: "center", vertical: "middle", wrapText: false };
+        cell.border = {
+            top: { style: "thin", color: { argb: "FFB0BEC5" } },
+            left: { style: "thin", color: { argb: "FFB0BEC5" } },
+            bottom: { style: "thin", color: { argb: "FFB0BEC5" } },
+            right: { style: "thin", color: { argb: "FFB0BEC5" } }
+        };
+    });
+    row.height = 22;
+}
+
+function xlsxStyleDataRow(ws, row, isAlt) {
+    row.eachCell({ includeEmpty: true }, cell => {
+        cell.fill = {
+            type: "pattern", pattern: "solid",
+            fgColor: { argb: isAlt ? "FFf0f9ff" : "FFFFFFFF" }
+        };
+        cell.alignment = { vertical: "middle" };
+        cell.border = {
+            top: { style: "hair", color: { argb: "FFe5e7eb" } },
+            left: { style: "hair", color: { argb: "FFe5e7eb" } },
+            bottom: { style: "hair", color: { argb: "FFe5e7eb" } },
+            right: { style: "hair", color: { argb: "FFe5e7eb" } }
+        };
+    });
+    row.height = 18;
+}
+
+function xlsxStyleSheet(ws) {
+    ws.views = [{ state: "frozen", ySplit: 1 }];
+    ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: ws.columnCount } };
+}
+
+function xlsxFormatCurrency(ws, colLetter, startRow, endRow) {
+    for (let r = startRow; r <= endRow; r++) {
+        const cell = ws.getCell(`${colLetter}${r}`);
+        cell.numFmt = '"$"#,##0';
+        cell.alignment = { horizontal: "right", vertical: "middle" };
+    }
+}
+
+function tipoLabel(isExterno, empresa) {
+    return isExterno ? (empresa || "Externo") : "Propio";
+}
+
 // Export all rentals for a client
 app.get("/exportar/cliente/:id", authMiddleware, async (req, res) => {
     try {
-        const cliente = await dbGet("SELECT * FROM clientes WHERE id=?", [req.params.id]);
+        const cliente = await dbGet("SELECT * FROM equioriente_clientes WHERE id=?", [req.params.id]);
         if (!cliente) return res.status(404).send("Cliente no encontrado");
 
         const alqs = await dbAll(`
             SELECT al.id, al.fecha_salida, al.fecha_devolucion_esperada, al.fecha_devolucion_real,
                    al.estado, al.notas, u.usuario as operario
-            FROM alquileres al
-            JOIN usuarios u ON al.usuario_id = u.id
+            FROM equioriente_alquileres al
+            JOIN equioriente_usuarios u ON al.usuario_id = u.id
             WHERE al.cliente_id = ?
             ORDER BY al.id DESC`, [req.params.id]);
 
         const items = await dbAll(`
-            SELECT ai.alquiler_id, a.referencia, a.nombre, ai.cantidad, ai.cantidad_devuelta,
+            SELECT ai.alquiler_id, a.referencia, a.es_externo, a.empresa_externa,
+                   a.nombre, ai.cantidad, ai.cantidad_devuelta,
                    ai.precio_dia_aplicado, ai.dias_acordados, ai.dias_reales,
                    COALESCE(ai.total_calculado, ai.precio_dia_aplicado * COALESCE(ai.dias_reales, ai.dias_acordados) * ai.cantidad) as subtotal
-            FROM alquiler_items ai
-            JOIN articulos a ON ai.articulo_id = a.id
-            JOIN alquileres al ON ai.alquiler_id = al.id
+            FROM equioriente_alquiler_items ai
+            JOIN equioriente_articulos a ON ai.articulo_id = a.id
+            JOIN equioriente_alquileres al ON ai.alquiler_id = al.id
             WHERE al.cliente_id = ?
             ORDER BY ai.alquiler_id DESC, a.nombre`, [req.params.id]);
 
         const workbook = new ExcelJS.Workbook();
-        const ws1 = workbook.addWorksheet("Alquileres");
+        workbook.creator = "Equioriente";
+        workbook.created = new Date();
 
         // Sheet 1: Rentals summary
-        const alqData = [
-            ["#", "Fecha Salida", "Dev. Esperada", "Dev. Real", "Estado", "Operario", "Notas"],
-            ...alqs.map(a => [
+        const ws1 = workbook.addWorksheet("Alquileres");
+        ws1.columns = [
+            { header: "#",            key: "id",       width: 8  },
+            { header: "Fecha Salida", key: "fsal",     width: 20 },
+            { header: "Dev. Esperada",key: "fesp",     width: 14 },
+            { header: "Dev. Real",    key: "freal",    width: 20 },
+            { header: "Estado",       key: "estado",   width: 12 },
+            { header: "Operario",     key: "operario", width: 14 },
+            { header: "Notas",        key: "notas",    width: 35 },
+        ];
+        xlsxStyleHeader(ws1, ws1.getRow(1));
+        alqs.forEach((a, ri) => {
+            const row = ws1.addRow([
                 a.id,
                 (a.fecha_salida || "").substring(0, 16).replace("T", " "),
                 a.fecha_devolucion_esperada || "",
@@ -847,22 +936,38 @@ app.get("/exportar/cliente/:id", authMiddleware, async (req, res) => {
                 a.estado,
                 a.operario,
                 a.notas || ""
-            ])
-        ];
-        ws1.addRows(alqData);
-        const ws1Cols = [8, 18, 14, 14, 10, 12, 30];
-        ws1.columns.forEach((col, i) => { if(ws1Cols[i]) col.width = ws1Cols[i]; });
+            ]);
+            xlsxStyleDataRow(ws1, row, ri % 2 !== 0);
+        });
+        xlsxStyleSheet(ws1);
 
         // Sheet 2: Items detail
         const ws2 = workbook.addWorksheet("Items");
-        const itemData = [
-            ["Alquiler #", "Referencia", "Articulo", "Cantidad", "Devuelto", "Precio/dia", "Dias", "Subtotal"],
-            ...items.map(i => [i.alquiler_id, i.referencia, i.nombre, i.cantidad, i.cantidad_devuelta,
-                i.precio_dia_aplicado, i.dias_reales || i.dias_acordados, i.subtotal])
+        ws2.columns = [
+            { header: "Alquiler #",  key: "alq_id",   width: 10 },
+            { header: "Referencia",  key: "ref",       width: 14 },
+            { header: "Tipo",        key: "tipo",      width: 14 },
+            { header: "Articulo",    key: "nombre",    width: 30 },
+            { header: "Cantidad",    key: "cant",      width: 9  },
+            { header: "Devuelto",    key: "dev",       width: 9  },
+            { header: "Precio/dia",  key: "precio",    width: 13 },
+            { header: "Dias",        key: "dias",      width: 6  },
+            { header: "Subtotal",    key: "subtotal",  width: 16 },
         ];
-        ws2.addRows(itemData);
-        const ws2Cols = [10, 12, 28, 8, 8, 12, 6, 14];
-        ws2.columns.forEach((col, i) => { if(ws2Cols[i]) col.width = ws2Cols[i]; });
+        xlsxStyleHeader(ws2, ws2.getRow(1));
+        items.forEach((i, ri) => {
+            const row = ws2.addRow([
+                i.alquiler_id, i.referencia, tipoLabel(i.es_externo, i.empresa_externa),
+                i.nombre, i.cantidad, i.cantidad_devuelta,
+                i.precio_dia_aplicado, i.dias_reales || i.dias_acordados, i.subtotal
+            ]);
+            xlsxStyleDataRow(ws2, row, ri % 2 !== 0);
+            row.getCell(7).numFmt = '"$"#,##0';
+            row.getCell(7).alignment = { horizontal: "right", vertical: "middle" };
+            row.getCell(9).numFmt = '"$"#,##0';
+            row.getCell(9).alignment = { horizontal: "right", vertical: "middle" };
+        });
+        xlsxStyleSheet(ws2);
 
         const safeName = cliente.nombre.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30);
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
@@ -882,48 +987,81 @@ app.get("/exportar/dia/:fecha", authMiddleware, async (req, res) => {
             SELECT al.id, c.nombre as cliente, c.telefono, c.identificacion,
                    al.fecha_salida, al.fecha_devolucion_esperada, al.fecha_devolucion_real,
                    al.estado, al.notas, u.usuario as operario
-            FROM alquileres al
-            JOIN clientes c ON al.cliente_id = c.id
-            JOIN usuarios u ON al.usuario_id = u.id
+            FROM equioriente_alquileres al
+            JOIN equioriente_clientes c ON al.cliente_id = c.id
+            JOIN equioriente_usuarios u ON al.usuario_id = u.id
             WHERE DATE(al.fecha_salida) = ?
             ORDER BY al.id`, [fecha]);
 
         const alqIds = alqs.map(a => a.id);
         const items = alqIds.length ? await dbAll(`
-            SELECT ai.alquiler_id, a.referencia, a.nombre, ai.cantidad, ai.cantidad_devuelta,
+            SELECT ai.alquiler_id, a.referencia, a.es_externo, a.empresa_externa,
+                   a.nombre, ai.cantidad, ai.cantidad_devuelta,
                    ai.precio_dia_aplicado, ai.dias_acordados, ai.dias_reales,
                    COALESCE(ai.total_calculado, ai.precio_dia_aplicado * COALESCE(ai.dias_reales, ai.dias_acordados) * ai.cantidad) as subtotal
-            FROM alquiler_items ai
-            JOIN articulos a ON ai.articulo_id = a.id
+            FROM equioriente_alquiler_items ai
+            JOIN equioriente_articulos a ON ai.articulo_id = a.id
             WHERE ai.alquiler_id IN (${alqIds.map(() => "?").join(",")})
             ORDER BY ai.alquiler_id, a.nombre`, alqIds) : [];
 
         const workbook = new ExcelJS.Workbook();
-        const ws1 = workbook.addWorksheet(`Alquileres ${fecha}`);
+        workbook.creator = "Equioriente";
+        workbook.created = new Date();
 
-        const alqData = [
-            ["#", "Cliente", "Telefono", "ID/NIT", "Fecha Salida", "Dev. Esperada", "Dev. Real", "Estado", "Operario", "Notas"],
-            ...alqs.map(a => [
+        // Sheet 1: Rentals summary
+        const ws1 = workbook.addWorksheet(`Alquileres ${fecha}`);
+        ws1.columns = [
+            { header: "#",            key: "id",       width: 8  },
+            { header: "Cliente",      key: "cliente",  width: 26 },
+            { header: "Telefono",     key: "tel",      width: 14 },
+            { header: "ID/NIT",       key: "idnit",    width: 14 },
+            { header: "Fecha Salida", key: "fsal",     width: 20 },
+            { header: "Dev. Esperada",key: "fesp",     width: 14 },
+            { header: "Dev. Real",    key: "freal",    width: 20 },
+            { header: "Estado",       key: "estado",   width: 12 },
+            { header: "Operario",     key: "operario", width: 14 },
+            { header: "Notas",        key: "notas",    width: 35 },
+        ];
+        xlsxStyleHeader(ws1, ws1.getRow(1));
+        alqs.forEach((a, ri) => {
+            const row = ws1.addRow([
                 a.id, a.cliente, a.telefono || "", a.identificacion || "",
                 (a.fecha_salida || "").substring(0, 16).replace("T", " "),
                 a.fecha_devolucion_esperada || "",
                 (a.fecha_devolucion_real || "").substring(0, 16).replace("T", " "),
                 a.estado, a.operario, a.notas || ""
-            ])
-        ];
-        ws1.addRows(alqData);
-        const ws1Cols = [8, 24, 14, 14, 18, 14, 14, 10, 12, 30];
-        ws1.columns.forEach((col, i) => { if(ws1Cols[i]) col.width = ws1Cols[i]; });
+            ]);
+            xlsxStyleDataRow(ws1, row, ri % 2 !== 0);
+        });
+        xlsxStyleSheet(ws1);
 
+        // Sheet 2: Items detail
         const ws2 = workbook.addWorksheet("Items");
-        const itemData = [
-            ["Alquiler #", "Referencia", "Articulo", "Cantidad", "Devuelto", "Precio/dia", "Dias", "Subtotal"],
-            ...items.map(i => [i.alquiler_id, i.referencia, i.nombre, i.cantidad, i.cantidad_devuelta,
-                i.precio_dia_aplicado, i.dias_reales || i.dias_acordados, i.subtotal])
+        ws2.columns = [
+            { header: "Alquiler #",  key: "alq_id",   width: 10 },
+            { header: "Referencia",  key: "ref",       width: 14 },
+            { header: "Tipo",        key: "tipo",      width: 14 },
+            { header: "Articulo",    key: "nombre",    width: 30 },
+            { header: "Cantidad",    key: "cant",      width: 9  },
+            { header: "Devuelto",    key: "dev",       width: 9  },
+            { header: "Precio/dia",  key: "precio",    width: 13 },
+            { header: "Dias",        key: "dias",      width: 6  },
+            { header: "Subtotal",    key: "subtotal",  width: 16 },
         ];
-        ws2.addRows(itemData);
-        const ws2Cols = [10, 12, 28, 8, 8, 12, 6, 14];
-        ws2.columns.forEach((col, i) => { if(ws2Cols[i]) col.width = ws2Cols[i]; });
+        xlsxStyleHeader(ws2, ws2.getRow(1));
+        items.forEach((i, ri) => {
+            const row = ws2.addRow([
+                i.alquiler_id, i.referencia, tipoLabel(i.es_externo, i.empresa_externa),
+                i.nombre, i.cantidad, i.cantidad_devuelta,
+                i.precio_dia_aplicado, i.dias_reales || i.dias_acordados, i.subtotal
+            ]);
+            xlsxStyleDataRow(ws2, row, ri % 2 !== 0);
+            row.getCell(7).numFmt = '"$"#,##0';
+            row.getCell(7).alignment = { horizontal: "right", vertical: "middle" };
+            row.getCell(9).numFmt = '"$"#,##0';
+            row.getCell(9).alignment = { horizontal: "right", vertical: "middle" };
+        });
+        xlsxStyleSheet(ws2);
 
         res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
         res.setHeader("Content-Disposition", `attachment; filename="equioriente_dia_${fecha}.xlsx"`);
@@ -933,178 +1071,165 @@ app.get("/exportar/dia/:fecha", authMiddleware, async (req, res) => {
 });
 
 // ── PDF RECIBO ────────────────────────────────────────
-app.get("/alquileres/:id/pdf", authMiddleware, (req, res) => {
+app.get("/alquileres/:id/pdf", authMiddleware, async (req, res) => {
     const alqId = req.params.id;
-
-    db.get(`SELECT al.*, c.nombre as cliente_nombre, c.identificacion as cliente_id_doc,
-                   c.telefono as cliente_tel, c.direccion as cliente_dir,
-                   u.usuario as operario
-            FROM alquileres al
-            JOIN clientes c ON al.cliente_id = c.id
-            JOIN usuarios u ON al.usuario_id = u.id
-            WHERE al.id=?`, [alqId], (err, alq) => {
+    try {
+        const alq = await dbGet(
+            `SELECT al.*, c.nombre as cliente_nombre, c.identificacion as cliente_id_doc,
+                    c.telefono as cliente_tel, c.direccion as cliente_dir, u.usuario as operario
+             FROM equioriente_alquileres al
+             JOIN equioriente_clientes c ON al.cliente_id = c.id
+             JOIN equioriente_usuarios u ON al.usuario_id = u.id
+             WHERE al.id=?`, [alqId]);
         if (!alq) return res.status(404).send("No encontrado");
 
-        db.all(`SELECT ai.*, a.nombre, a.referencia, a.es_externo, a.empresa_externa
-                FROM alquiler_items ai
-                JOIN articulos a ON ai.articulo_id = a.id
-                WHERE ai.alquiler_id=?`, [alqId], (err2, items) => {
+        const items = await dbAll(
+            `SELECT ai.*, a.nombre, a.referencia, a.es_externo, a.empresa_externa
+             FROM equioriente_alquiler_items ai
+             JOIN equioriente_articulos a ON ai.articulo_id = a.id
+             WHERE ai.alquiler_id=?`, [alqId]);
 
-            const tmpDir = os.tmpdir();
-            const pdfPath = path.join(tmpDir, `recibo_${alqId}.pdf`);
-            const scriptPath = path.join(tmpDir, `gen_pdf_${alqId}.py`);
-
-            const safeData = JSON.stringify({ alq, items }).replace(/\\/g, "\\\\");
-
-            const pyScript = `# -*- coding: utf-8 -*-
-import json, sys, datetime
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
-
-data  = json.loads(${JSON.stringify(safeData)})
-alq   = data['alq']
-items = data['items']
-
-out_path = ${JSON.stringify(pdfPath)}
-
-doc = SimpleDocTemplate(out_path, pagesize=A4,
-    leftMargin=20*mm, rightMargin=20*mm, topMargin=15*mm, bottomMargin=15*mm)
-story = []
-
-def sty(fname='Helvetica', fsize=9, color='#111827', align=0, sa=0, bg=None, bp=0):
-    kw = dict(fontName=fname, fontSize=fsize,
-              textColor=colors.HexColor(color), alignment=align, spaceAfter=sa)
-    if bg:  kw['backColor'] = colors.HexColor(bg)
-    if bp:  kw['borderPadding'] = bp
-    return ParagraphStyle('_s', **kw)
-
-story.append(Paragraph("RECIBO DE ALQUILER",
-    sty('Helvetica-Bold', 20, '#1e3a5f', TA_CENTER, 2)))
-story.append(Paragraph("Gestion de Equipos y Materiales",
-    sty(fsize=10, color='#6b7280', align=TA_CENTER, sa=8)))
-story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor('#1e3a5f')))
-story.append(Spacer(1, 8))
-
-estado_color = '#059669' if alq.get('estado') == 'devuelto' else '#d97706' if alq.get('estado') == 'parcial' else '#dc2626'
-estado_text  = 'DEVUELTO' if alq.get('estado') == 'devuelto' else 'PARCIAL' if alq.get('estado') == 'parcial' else 'EN CURSO'
-fecha_sal    = str(alq.get('fecha_salida') or '')[:16].replace('T', ' ')
-fecha_esp    = str(alq.get('fecha_devolucion_esperada') or 'No especificada')[:10]
-fecha_real   = str(alq.get('fecha_devolucion_real') or '')[:16].replace('T', ' ') or '-'
-
-info_data = [
-    ['N Alquiler:', '#' + str(alq['id']).zfill(4), 'Estado:', estado_text],
-    ['Cliente:',   str(alq.get('cliente_nombre','')),   'ID/NIT:', str(alq.get('cliente_id_doc',''))],
-    ['Telefono:',  str(alq.get('cliente_tel','')),       'Direccion:', str(alq.get('cliente_dir',''))],
-    ['Fecha salida:', fecha_sal,                          'Dev. esperada:', fecha_esp],
-    ['Operario:',  str(alq.get('operario','')),           'Dev. real:', fecha_real],
-]
-it = Table(info_data, colWidths=[38*mm, 55*mm, 45*mm, 45*mm])
-it.setStyle(TableStyle([
-    ('FONTNAME',  (0,0),(-1,-1), 'Helvetica'),
-    ('FONTNAME',  (0,0),(0,-1),  'Helvetica-Bold'),
-    ('FONTNAME',  (2,0),(2,-1),  'Helvetica-Bold'),
-    ('FONTSIZE',  (0,0),(-1,-1), 9),
-    ('TEXTCOLOR', (3,0),(3,0),   colors.HexColor(estado_color)),
-    ('FONTNAME',  (3,0),(3,0),   'Helvetica-Bold'),
-    ('ROWBACKGROUNDS',(0,0),(-1,-1),[colors.white, colors.HexColor('#f8fafc')]),
-    ('TOPPADDING',(0,0),(-1,-1), 4), ('BOTTOMPADDING',(0,0),(-1,-1), 4),
-    ('LEFTPADDING',(0,0),(-1,-1),4),
-    ('BOX',       (0,0),(-1,-1), 0.5, colors.HexColor('#e5e7eb')),
-    ('INNERGRID', (0,0),(-1,-1), 0.25, colors.HexColor('#e5e7eb')),
-]))
-story.append(it)
-story.append(Spacer(1, 12))
-
-story.append(Paragraph("Detalle de Articulos",
-    sty('Helvetica-Bold', 11, '#1e3a5f', sa=6)))
-
-rows = [['Ref.', 'Articulo', 'Cant.', 'Devuelto', 'Precio/dia', 'Dias', 'Subtotal']]
-grand_total = 0
-for i in items:
-    dias     = i.get('dias_reales') or i.get('dias_acordados') or 1
-    subtotal = i.get('total_calculado') or (i['precio_dia_aplicado'] * dias * i['cantidad'])
-    grand_total += subtotal
-    rows.append([
-        str(i.get('referencia','')),
-        str(i.get('nombre','')),
-        str(i['cantidad']),
-        str(i.get('cantidad_devuelta', 0)),
-        '$' + '{:,.0f}'.format(i['precio_dia_aplicado']),
-        str(dias),
-        '$' + '{:,.0f}'.format(subtotal),
-    ])
-
-tbl = Table(rows, colWidths=[22*mm, 55*mm, 16*mm, 20*mm, 24*mm, 14*mm, 32*mm], repeatRows=1)
-tbl.setStyle(TableStyle([
-    ('BACKGROUND', (0,0),(-1,0),  colors.HexColor('#1e3a5f')),
-    ('TEXTCOLOR',  (0,0),(-1,0),  colors.white),
-    ('FONTNAME',   (0,0),(-1,0),  'Helvetica-Bold'),
-    ('FONTNAME',   (0,1),(-1,-1), 'Helvetica'),
-    ('FONTSIZE',   (0,0),(-1,-1), 9),
-    ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white, colors.HexColor('#f0f9ff')]),
-    ('ALIGN',      (2,0),(-1,-1), 'CENTER'),
-    ('TOPPADDING', (0,0),(-1,-1), 5), ('BOTTOMPADDING',(0,0),(-1,-1), 5),
-    ('LEFTPADDING',(0,0),(-1,-1), 4),
-    ('BOX',        (0,0),(-1,-1), 0.5, colors.HexColor('#e5e7eb')),
-    ('INNERGRID',  (0,0),(-1,-1), 0.25, colors.HexColor('#e5e7eb')),
-]))
-story.append(tbl)
-story.append(Spacer(1, 10))
-
-tot = Table([['', 'TOTAL: $' + '{:,.0f}'.format(grand_total)]],
-            colWidths=[130*mm, 53*mm])
-tot.setStyle(TableStyle([
-    ('BACKGROUND',(1,0),(1,0), colors.HexColor('#1e3a5f')),
-    ('TEXTCOLOR', (1,0),(1,0), colors.white),
-    ('FONTNAME',  (1,0),(1,0), 'Helvetica-Bold'),
-    ('FONTSIZE',  (1,0),(1,0), 13),
-    ('ALIGN',     (1,0),(1,0), 'CENTER'),
-    ('TOPPADDING',(0,0),(-1,-1),8), ('BOTTOMPADDING',(0,0),(-1,-1),8),
-]))
-story.append(tot)
-
-if alq.get('notas'):
-    story.append(Spacer(1, 10))
-    story.append(Paragraph('<b>Notas:</b> ' + str(alq['notas']),
-        sty(color='#374151', bg='#fef9c3', bp=6)))
-
-story.append(Spacer(1, 20))
-story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#e5e7eb')))
-story.append(Spacer(1, 6))
-now_str = datetime.datetime.now().strftime('%d/%m/%Y %H:%M')
-story.append(Paragraph(
-    'Documento generado el ' + now_str + '  |  Firma cliente: _________________________',
-    sty(fsize=8, color='#9ca3af', align=TA_CENTER)))
-
-doc.build(story)
-`;
-
-            try {
-                fs.writeFileSync(scriptPath, pyScript, { encoding: 'utf8' });
-                const cmd = process.platform === 'win32'
-                    ? `python "${scriptPath}"`
-                    : `python3 "${scriptPath}"`;
-                execSync(cmd, { timeout: 20000 });
-                const pdf = fs.readFileSync(pdfPath);
-                res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Type", "application/pdf");
                 res.setHeader("Content-Disposition", `inline; filename="recibo_${alqId}.pdf"`);
-                res.send(pdf);
-            } catch (e) {
-                console.error("PDF Error:", e.stderr ? e.stderr.toString() : e.message);
-                res.status(500).send(
-                    "Error generando PDF. Asegurese de tener Python y reportlab instalados " +
-                    "(pip install reportlab). Detalle: " + (e.stderr ? e.stderr.toString() : e.message)
-                );
-            } finally {
-                try { fs.unlinkSync(scriptPath); } catch(_) {}
-                try { fs.unlinkSync(pdfPath); } catch(_) {}
-            }
-        });
-    });
+
+                const doc = new PDFDocument({ size: "A4", margin: 0, bufferPages: true });
+                doc.pipe(res);
+
+                const L = 40, R = 40, PW = 595 - L - R; // page width usable = 515
+
+                const fmtMoney = n => "$" + Number(n || 0).toLocaleString("es-CO", { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+                const hline = (y, color = "#e5e7eb", w = 0.5) =>
+                    doc.moveTo(L, y).lineTo(L + PW, y).strokeColor(color).lineWidth(w).stroke();
+
+                // ── Title ──────────────────────────────────────────────
+                doc.font("Helvetica-Bold").fontSize(22).fillColor("#1e3a5f")
+                   .text("RECIBO DE ALQUILER", L, 40, { align: "center", width: PW });
+                doc.font("Helvetica").fontSize(10).fillColor("#6b7280")
+                   .text("Gestion de Equipos y Materiales", L, 68, { align: "center", width: PW });
+                hline(84, "#1e3a5f", 2);
+
+                // ── Info table ─────────────────────────────────────────
+                const estado = alq.estado;
+                const estadoColor = estado === "devuelto" ? "#059669" : estado === "parcial" ? "#d97706" : "#dc2626";
+                const estadoText  = estado === "devuelto" ? "DEVUELTO" : estado === "parcial" ? "PARCIAL" : "EN CURSO";
+                const fechaSal  = (alq.fecha_salida || "").substring(0, 16).replace("T", " ");
+                const fechaEsp  = alq.fecha_devolucion_esperada || "No especificada";
+                const fechaReal = (alq.fecha_devolucion_real || "").substring(0, 16).replace("T", " ") || "-";
+
+                const infoRows = [
+                    ["N° Alquiler:", "#" + String(alq.id).padStart(4, "0"), "Estado:", estadoText],
+                    ["Cliente:",          alq.cliente_nombre || "",               "ID/NIT:", alq.cliente_id_doc || ""],
+                    ["Telefono:",         alq.cliente_tel || "",                  "Direccion:", alq.cliente_dir || ""],
+                    ["Fecha salida:",     fechaSal,                               "Dev. esperada:", fechaEsp],
+                    ["Operario:",         alq.operario || "",                     "Dev. real:",     fechaReal],
+                ];
+
+                const IH = 18;
+                const COL = [80, PW / 2 - 80, 80, PW / 2 - 80];
+                let iy = 94;
+                infoRows.forEach((row, ri) => {
+                    doc.fillColor(ri % 2 === 0 ? "#ffffff" : "#f8fafc")
+                       .rect(L, iy, PW, IH).fill();
+                    let cx = L;
+                    row.forEach((cell, ci) => {
+                        const isLbl = ci % 2 === 0;
+                        const isStatus = ri === 0 && ci === 3;
+                        doc.font(isLbl || isStatus ? "Helvetica-Bold" : "Helvetica")
+                           .fontSize(9)
+                           .fillColor(isStatus ? estadoColor : "#111827")
+                           .text(String(cell), cx + 4, iy + 4, { width: COL[ci] - 8, lineBreak: false, ellipsis: true });
+                        cx += COL[ci];
+                    });
+                    iy += IH;
+                });
+                doc.rect(L, 94, PW, IH * infoRows.length)
+                   .strokeColor("#e5e7eb").lineWidth(0.4).stroke();
+
+                // ── Items table ────────────────────────────────────────
+                iy += 14;
+                doc.font("Helvetica-Bold").fontSize(11).fillColor("#1e3a5f")
+                   .text("Detalle de Articulos", L, iy);
+                iy += 18;
+
+                const CW  = [50, 46, 118, 30, 34, 52, 28, 65]; // Ref, Tipo, Articulo, Cant, Dev, Precio, Dias, Subtotal
+                const HDR = ["Ref.", "Tipo", "Articulo", "Cant.", "Dev.", "Precio/dia", "Dias", "Subtotal"];
+                const RH  = 20;
+
+                const drawRow = (cells, y, isHeader, isAlt) => {
+                    const totalW = CW.reduce((a, b) => a + b, 0);
+                    if (isHeader) doc.fillColor("#1e3a5f").rect(L, y, totalW, RH).fill();
+                    else doc.fillColor(isAlt ? "#f0f9ff" : "#ffffff").rect(L, y, totalW, RH).fill();
+                    let cx = L;
+                    cells.forEach((cell, i) => {
+                        const right = i >= 3;
+                        doc.font(isHeader ? "Helvetica-Bold" : "Helvetica")
+                           .fontSize(8.5)
+                           .fillColor(isHeader ? "white" : "#111827")
+                           .text(String(cell ?? ""), cx + 3, y + (RH - 8.5) / 2,
+                                 { width: CW[i] - 6, lineBreak: false, ellipsis: true, align: right ? "center" : "left" });
+                        cx += CW[i];
+                    });
+                    doc.rect(L, y, totalW, RH).strokeColor("#e5e7eb").lineWidth(0.3).stroke();
+                };
+
+                drawRow(HDR, iy, true, false);
+                iy += RH;
+
+                let grandTotal = 0;
+                (items || []).forEach((item, ri) => {
+                    const dias     = item.dias_reales || item.dias_acordados || 1;
+                    const subtotal = item.total_calculado || (item.precio_dia_aplicado * dias * item.cantidad);
+                    grandTotal += subtotal;
+                    const tipo = item.es_externo ? (item.empresa_externa || "Externo") : "Propio";
+                    drawRow([
+                        item.referencia || "", tipo, item.nombre || "",
+                        item.cantidad, item.cantidad_devuelta || 0,
+                        fmtMoney(item.precio_dia_aplicado), dias, fmtMoney(subtotal)
+                    ], iy, false, ri % 2 !== 0);
+                    iy += RH;
+                    if (iy > 760) {
+                        doc.addPage();
+                        iy = 40;
+                        drawRow(HDR, iy, true, false);
+                        iy += RH;
+                    }
+                });
+
+                // ── Total ──────────────────────────────────────────────
+                iy += 6;
+                const TW = 135;
+                doc.fillColor("#1e3a5f").rect(L + PW - TW, iy, TW, 26).fill();
+                doc.font("Helvetica-Bold").fontSize(12).fillColor("white")
+                   .text("TOTAL: " + fmtMoney(grandTotal), L + PW - TW + 4, iy + 7,
+                         { width: TW - 8, align: "center", lineBreak: false });
+                iy += 34;
+
+                // ── Notes ──────────────────────────────────────────────
+                if (alq.notas) {
+                    doc.fillColor("#fef9c3").rect(L, iy, PW, 28).fill();
+                    doc.rect(L, iy, PW, 28).strokeColor("#d97706").lineWidth(0.5).stroke();
+                    doc.font("Helvetica-Bold").fontSize(9).fillColor("#374151")
+                       .text("Notas: ", L + 6, iy + 9, { continued: true, lineBreak: false });
+                    doc.font("Helvetica").fillColor("#374151").text(alq.notas, { lineBreak: false });
+                    iy += 36;
+                }
+
+                // ── Footer ─────────────────────────────────────────────
+                iy += 14;
+                hline(iy, "#e5e7eb", 0.5);
+                iy += 8;
+                const nowStr = new Date().toLocaleString("es-CO", {
+                    day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit"
+                });
+                doc.font("Helvetica").fontSize(8).fillColor("#9ca3af")
+                   .text(`Documento generado el ${nowStr}  |  Firma cliente: _________________________`,
+                         L, iy, { align: "center", width: PW });
+
+        doc.end();
+    } catch (e) {
+        console.error("PDF Error:", e.message);
+        if (!res.headersSent) res.status(500).send("Error generando PDF: " + e.message);
+    }
 });
 
 app.listen(3000, () => console.log("Servidor corriendo en http://localhost:3000"));
