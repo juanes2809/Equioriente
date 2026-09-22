@@ -5,25 +5,48 @@ const ExcelJS = require("exceljs");
 const PDFDocument = require("pdfkit");
 const bcrypt  = require("bcrypt");
 const jwt     = require("jsonwebtoken");
+if (typeof global.WebSocket === "undefined") {
+    try { global.WebSocket = require("ws"); }
+    catch { global.WebSocket = class { constructor() {} close() {} addEventListener() {} removeEventListener() {} send() {} }; }
+}
 const { createClient } = require("@supabase/supabase-js");
+const { createLocalDb } = require("./lib/localDb");
+
+function loadEnv() {
+    const p = path.join(__dirname, ".env");
+    if (!fs.existsSync(p)) return;
+    for (const line of fs.readFileSync(p, "utf8").split("\n")) {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) continue;
+        const i = t.indexOf("=");
+        if (i < 0) continue;
+        const k = t.slice(0, i).trim();
+        const v = t.slice(i + 1).trim();
+        if (k && process.env[k] == null) process.env[k] = v;
+    }
+}
+loadEnv();
 
 // ── Config ────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role key
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const JWT_SECRET   = process.env.JWT_SECRET || "equioriente_secret_change_me";
 const SALT_ROUNDS  = 10;
 const PORT = parseInt(process.env.PORT) || 3000;
 const BACKUP_DIR = path.join(__dirname, "backups");
+const DATA_DIR = path.join(__dirname, "Equioriente_Data");
+const STORE_PATH = path.join(__dirname, "data", "store.json");
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error("ERROR: SUPABASE_URL y SUPABASE_KEY son requeridos en .env");
-    process.exit(1);
+const supabaseConfigured = !!(SUPABASE_URL && SUPABASE_KEY
+    && !/tu-proyecto|tu_service/i.test(String(SUPABASE_URL) + String(SUPABASE_KEY)));
+
+const sb = supabaseConfigured
+    ? createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } })
+    : createLocalDb(STORE_PATH);
+
+if (!supabaseConfigured) {
+    console.log("Supabase no configurado — usando datos locales:", STORE_PATH);
 }
-
-// ── Supabase client ───────────────────────────────────
-const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
-    auth: { persistSession: false }
-});
 
 // ── Nombres de tabla ──────────────────────────────────
 const T = {
@@ -36,6 +59,20 @@ const T = {
     dp: "equioriente_devoluciones_proveedor",
     mv: "equioriente_movimientos_inventario",
     dn: "equioriente_registro_danos",
+    re: "equioriente_remitos",
+    ri: "equioriente_remito_items",
+    pg: "equioriente_pagos",
+    fl: "equioriente_flujo_caja",
+    doc:"equioriente_documentos",
+    co: "equioriente_cotizaciones",
+    ci: "equioriente_cotizacion_items",
+    ob: "equioriente_obras",
+    cu: "equioriente_cuentas",
+    pe: "equioriente_periodos_cuenta",
+    om: "equioriente_movimientos",
+    sp: "equioriente_saldos_periodo",
+    cb: "equioriente_cobros",
+    vj: "equioriente_viajes",
 };
 
 // ── Helpers Supabase ──────────────────────────────────
@@ -76,6 +113,37 @@ const ajustarStock = (id, { total = 0, disponible = 0, danado = 0 } = {}) =>
 const logMov = (articulo_id, tipo, cantidad, motivo, referencia_id, usuario_id) =>
     sqInsert(T.mv, { articulo_id, tipo, cantidad, motivo,
         referencia_id: referencia_id ?? null, usuario_id: usuario_id ?? null });
+
+function hoyYmd() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+async function insertViaje(data) {
+    const tipo = ["llevada", "recogida", "ida_vuelta"].includes(data.tipo) ? data.tipo : "llevada";
+    const quien = ["equioriente", "cliente"].includes(data.quien) ? data.quien : "equioriente";
+    const r = await sqInsert(T.vj, {
+        alquiler_id: data.alquiler_id || null,
+        periodo_id: data.periodo_id || null,
+        remito_id: data.remito_id || null,
+        tipo,
+        quien,
+        precio: Number(data.precio) || 0,
+        placa: data.placa || null,
+        direccion: data.direccion || null,
+        fecha: data.fecha || hoyYmd(),
+        notas: data.notas || null
+    });
+    if (data.alquiler_id && quien === "equioriente") {
+        const alq = await sqOne(sb.from(T.al).select("transporte").eq("id", data.alquiler_id));
+        const sum = (Number(alq?.transporte) || 0) + (Number(data.precio) || 0);
+        await sqUpdate(T.al, { transporte: sum }, data.alquiler_id);
+        if (data.periodo_id) {
+            const per = await sqOne(sb.from(T.pe).select("transporte").eq("id", data.periodo_id));
+            if (per) await sqUpdate(T.pe, { transporte: (Number(per.transporte) || 0) + (Number(data.precio) || 0) }, data.periodo_id);
+        }
+    }
+    return r.lastID;
+}
 
 // Flatten un campo de join anidado a campos planos
 const flat = (row, joinKey, mapping) => {
@@ -151,6 +219,36 @@ app.get("/clientes", authMiddleware, async (req, res) => {
         let q = sb.from(T.cl).select("*").order("nombre");
         if (buscar) q = q.or(`nombre.ilike.%${buscar}%,identificacion.ilike.%${buscar}%,telefono.ilike.%${buscar}%`);
         res.json(await sq(q));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get("/clientes/:id", authMiddleware, async (req, res) => {
+    try {
+        const cli = await sqOne(sb.from(T.cl).select("*").eq("id", req.params.id));
+        if (!cli) return res.status(404).json({ error: "Cliente no encontrado" });
+        const cuentas = await sq(sb.from(T.cu).select("*").eq("cliente_id", req.params.id));
+        const obras = await sq(sb.from(T.ob).select("*").eq("cliente_id", req.params.id));
+        const ctaMap = byId(cuentas);
+        const obraMap = byId(obras);
+        const cuentaIds = cuentas.map(c => c.id);
+        const periodos = cuentaIds.length
+            ? await sq(sb.from(T.pe).select("*").in("cuenta_id", cuentaIds).order("anio_mes", { ascending: false }))
+            : [];
+        const alquileres = await sq(sb.from(T.al).select("*").eq("cliente_id", req.params.id).order("id", { ascending: false }));
+        const pagos = await sq(sb.from(T.pg).select("*").eq("cliente_id", req.params.id).order("id", { ascending: false }));
+        res.json({
+            ...cli,
+            periodos: periodos.map(p => {
+                const cta = ctaMap.get(String(p.cuenta_id)) || {};
+                const obra = obraMap.get(String(cta.obra_id)) || {};
+                return {
+                    ...p,
+                    tipo_documento: p.tipo_documento || cta.tipo_documento || null,
+                    obra: obra.direccion || obra.nombre || null
+                };
+            }),
+            alquileres,
+            pagos
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post("/clientes", authMiddleware, async (req, res) => {
@@ -252,7 +350,7 @@ app.get("/movimientos", authMiddleware, async (req, res) => {
 // ── ALQUILERES ────────────────────────────────────────
 app.post("/alquileres", authMiddleware, async (req, res) => {
     try {
-        const { cliente_id, usuario_id, fecha_devolucion_esperada, notas, items } = req.body;
+        const { cliente_id, usuario_id, fecha_devolucion_esperada, notas, items, tipo_fiscal, obra, viajes } = req.body;
         if (!items?.length) return res.status(400).send("Sin articulos");
 
         for (const item of items) {
@@ -263,8 +361,12 @@ app.post("/alquileres", authMiddleware, async (req, res) => {
 
         const r = await sqInsert(T.al, {
             cliente_id, usuario_id: usuario_id || req.user.id,
+            fecha_salida: new Date().toISOString(),
             fecha_devolucion_esperada: fecha_devolucion_esperada || null,
-            notas: notas || null
+            notas: notas || null,
+            tipo_fiscal: tipo_fiscal || "no_fiscal",
+            obra: obra || null,
+            transporte: 0
         });
         const alqId = r.lastID;
 
@@ -277,24 +379,36 @@ app.post("/alquileres", authMiddleware, async (req, res) => {
             await ajustarStock(item.articulo_id, { disponible: -item.cantidad });
             await logMov(item.articulo_id, "salida", item.cantidad, "Alquiler #" + alqId, alqId, req.user.id);
         }
+        if (Array.isArray(viajes)) {
+            for (const v of viajes) {
+                await insertViaje({
+                    ...v,
+                    alquiler_id: alqId,
+                    direccion: v.direccion || obra || null,
+                    fecha: v.fecha || hoyYmd()
+                });
+            }
+        }
         res.json({ id: alqId });
     } catch (e) { res.status(500).send(e.message); }
 });
 
 app.get("/alquileres", authMiddleware, async (req, res) => {
     try {
-        const { estado, buscar } = req.query;
+        const { estado, buscar, tipo_fiscal, periodo } = req.query;
         let q = sb.from(T.al)
             .select(`*, cliente:${T.cl}!cliente_id(nombre, identificacion, telefono), operario:${T.u}!usuario_id(usuario)`)
             .order("id", { ascending: false });
         if (estado) q = q.eq("estado", estado);
+        if (tipo_fiscal) q = q.eq("tipo_fiscal", tipo_fiscal);
+        if (periodo) q = q.eq("periodo", periodo);
         if (buscar) q = q.or(`cliente.nombre.ilike.%${buscar}%,cliente.identificacion.ilike.%${buscar}%`);
         const rows = await sq(q);
         res.json(rows.map(a => ({
             ...a,
             cliente_nombre: a.cliente?.nombre, cliente_id_doc: a.cliente?.identificacion,
             cliente_tel: a.cliente?.telefono, operario: a.operario?.usuario,
-            cliente: undefined, operario: undefined
+            cliente: undefined
         })));
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -316,8 +430,8 @@ app.get("/alquileres/:id/items", authMiddleware, async (req, res) => {
 app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
     try {
         const alqId = req.params.id;
-        const { items_devueltos } = req.body;
-        const alq = await sqOne(sb.from(T.al).select("fecha_salida, estado").eq("id", alqId));
+        const { items_devueltos, recogida } = req.body;
+        const alq = await sqOne(sb.from(T.al).select("fecha_salida, estado, obra, periodo_id").eq("id", alqId));
         if (!alq) return res.status(404).send("Alquiler no encontrado");
         if (alq.estado === "devuelto") return res.status(400).send("Ya fue devuelto completamente");
 
@@ -357,6 +471,19 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
         await sqUpdate(T.al, allRet
             ? { estado: "devuelto", fecha_devolucion_real: new Date().toISOString() }
             : { estado: "parcial" }, alqId);
+        if (recogida && (recogida.activa || Number(recogida.precio) > 0 || recogida.quien === "equioriente")) {
+            await insertViaje({
+                alquiler_id: alqId,
+                periodo_id: alq.periodo_id || null,
+                tipo: "recogida",
+                quien: recogida.quien || "equioriente",
+                precio: recogida.precio,
+                placa: recogida.placa,
+                direccion: recogida.direccion || alq.obra || null,
+                fecha: hoyYmd(),
+                notas: "Recogida en devolución"
+            });
+        }
         res.json({ msg: allRet ? "Devuelto completamente" : "Devolucion parcial registrada", diasReales });
     } catch (e) { res.status(500).send(e.message); }
 });
@@ -492,9 +619,342 @@ app.get("/reportes/estadisticas", authMiddleware, async (req, res) => {
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.post("/viajes", authMiddleware, async (req, res) => {
+    try {
+        const { alquiler_id, periodo_id, remito_id, tipo, quien, precio, placa, direccion, fecha, notas } = req.body;
+        if (!alquiler_id && !periodo_id) return res.status(400).send("Falta alquiler o periodo");
+        const id = await insertViaje({ alquiler_id, periodo_id, remito_id, tipo, quien, precio, placa, direccion, fecha, notas });
+        res.json({ id });
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+app.get("/reportes/transporte", authMiddleware, async (req, res) => {
+    try {
+        const desde = req.query.desde || "";
+        const hasta = req.query.hasta || "";
+        const viajes = await sq(sb.from(T.vj).select("*").order("id", { ascending: false }));
+        const alqs = await sq(sb.from(T.al).select("id, cliente_id, obra, periodo, tipo_fiscal"));
+        const clis = await sq(sb.from(T.cl).select("id, nombre"));
+        const rems = await sq(sb.from(T.re).select("id, numero"));
+        const alqMap = byId(alqs);
+        const cliMap = byId(clis);
+        const remMap = byId(rems);
+        const fiscalRank = tf => (tf === "fiscal" ? 0 : tf === "no_fiscal" ? 1 : 2);
+        const inRange = v => {
+            const f = String(v.fecha || "");
+            if (desde && f && f < desde) return false;
+            if (hasta && f && f > hasta) return false;
+            return true;
+        };
+        const rows = viajes.filter(inRange).map(v => {
+            const alq = alqMap.get(String(v.alquiler_id)) || {};
+            const cli = cliMap.get(String(alq.cliente_id)) || {};
+            const rem = remMap.get(String(v.remito_id)) || {};
+            return {
+                ...v,
+                cliente_nombre: cli.nombre || "",
+                obra: v.direccion || alq.obra || "",
+                periodo: alq.periodo || (v.fecha || "").slice(0, 7),
+                tipo_fiscal: alq.tipo_fiscal || "",
+                remito_numero: rem.numero || null
+            };
+        });
+        // Un remito = un viaje de camión. Seguimiento y factura no se cuentan dos veces.
+        const best = new Map();
+        for (const v of rows) {
+            const key = v.remito_numero
+                ? "R:" + v.remito_numero
+                : "X:" + [v.cliente_nombre, v.fecha, v.tipo, v.precio].join("|");
+            const prev = best.get(key);
+            if (!prev || fiscalRank(v.tipo_fiscal) < fiscalRank(prev.tipo_fiscal)) best.set(key, v);
+        }
+        const unicos = [...best.values()];
+        const camion = unicos.filter(v => v.quien === "equioriente");
+        const ingreso = camion.reduce((s, v) => s + (Number(v.precio) || 0), 0);
+        const porTipo = (t) => camion.filter(v => v.tipo === t);
+        const porMes = {};
+        for (const v of camion) {
+            const m = (v.fecha || "").slice(0, 7) || v.periodo || "";
+            if (!porMes[m]) porMes[m] = { mes: m, viajes: 0, ingreso: 0, llevadas: 0, recogidas: 0 };
+            porMes[m].viajes += 1;
+            porMes[m].ingreso += Number(v.precio) || 0;
+            if (v.tipo === "llevada") porMes[m].llevadas += 1;
+            if (v.tipo === "recogida" || v.tipo === "ida_vuelta") porMes[m].recogidas += 1;
+        }
+        res.json({
+            totales: {
+                ingreso_camion: ingreso,
+                viajes_camion: camion.length,
+                llevadas: porTipo("llevada").length,
+                recogidas: porTipo("recogida").length + porTipo("ida_vuelta").length,
+                cliente_sin_camion: unicos.filter(v => v.quien === "cliente").length,
+                documentos_sin_dedup: rows.length
+            },
+            por_mes: Object.keys(porMes).sort().map(k => porMes[k]),
+            detalle: unicos
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DATOS INTEGRADOS (Equioriente_Data) ───────────────
+app.get("/datos/meta", authMiddleware, async (req, res) => {
+    try {
+        const meta = typeof sb._meta === "function" ? sb._meta() : {};
+        res.json({
+            origen: supabaseConfigured ? "supabase" : "local",
+            ...meta,
+            conteos: {
+                articulos: (await sq(sb.from(T.ar).select("id"))).length,
+                clientes: (await sq(sb.from(T.cl).select("id"))).length,
+                alquileres: (await sq(sb.from(T.al).select("id"))).length,
+                periodos: (await sq(sb.from(T.pe).select("id"))).length,
+                remitos: (await sq(sb.from(T.re).select("id"))).length,
+                cobros: (await sq(sb.from(T.cb).select("id"))).length,
+                pagos: (await sq(sb.from(T.pg).select("id"))).length,
+                flujo: (await sq(sb.from(T.fl).select("id"))).length,
+                documentos: (await sq(sb.from(T.doc).select("id"))).length
+            }
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+function byId(rows) {
+    const m = new Map();
+    for (const r of rows) m.set(String(r.id), r);
+    return m;
+}
+
+app.get("/periodos", authMiddleware, async (req, res) => {
+    try {
+        const { anio_mes, tipo_documento, buscar, estado } = req.query;
+        let q = sb.from(T.pe).select("*").order("id", { ascending: false });
+        if (anio_mes) q = q.eq("anio_mes", anio_mes);
+        if (estado) q = q.eq("estado", estado);
+        let periodos = await sq(q);
+        const [cuentas, clientes, obras] = await Promise.all([
+            sq(sb.from(T.cu).select("*")),
+            sq(sb.from(T.cl).select("*")),
+            sq(sb.from(T.ob).select("*"))
+        ]);
+        const ctaMap = byId(cuentas);
+        const cliMap = byId(clientes);
+        const obraMap = byId(obras);
+        let rows = periodos.map(p => {
+            const cta = ctaMap.get(String(p.cuenta_id)) || {};
+            const cli = cliMap.get(String(cta.cliente_id)) || {};
+            const obra = obraMap.get(String(cta.obra_id)) || {};
+            return {
+                ...p,
+                tipo_documento: p.tipo_documento || cta.tipo_documento || null,
+                cliente_id: cta.cliente_id || null,
+                cliente_nombre: cli.nombre || "",
+                cliente_tel: cli.telefono || cta.telefono || null,
+                obra: obra.direccion || obra.nombre || null
+            };
+        });
+        if (tipo_documento) rows = rows.filter(r => r.tipo_documento === tipo_documento);
+        if (buscar) {
+            const b = String(buscar).toLowerCase();
+            rows = rows.filter(r =>
+                (r.cliente_nombre || "").toLowerCase().includes(b) ||
+                (r.obra || "").toLowerCase().includes(b) ||
+                String(r.id).includes(b));
+        }
+        res.json(rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/periodos/:id", authMiddleware, async (req, res) => {
+    try {
+        const p = await sqOne(sb.from(T.pe).select("*").eq("id", req.params.id));
+        if (!p) return res.status(404).json({ error: "Periodo no encontrado" });
+        const cta = await sqOne(sb.from(T.cu).select("*").eq("id", p.cuenta_id));
+        const cli = cta ? await sqOne(sb.from(T.cl).select("*").eq("id", cta.cliente_id)) : null;
+        const obra = cta?.obra_id ? await sqOne(sb.from(T.ob).select("*").eq("id", cta.obra_id)) : null;
+        const remitos = await sq(sb.from(T.re).select("*").eq("periodo_id", p.id).order("id"));
+        const remIds = remitos.map(r => r.id);
+        const movs = remIds.length
+            ? await sq(sb.from(T.om).select("*").in("remito_id", remIds))
+            : [];
+        const byRem = {};
+        for (const m of movs) (byRem[m.remito_id] = byRem[m.remito_id] || []).push(m);
+        const saldos = await sq(sb.from(T.sp).select("*").eq("periodo_id", p.id));
+        const cobros = await sq(sb.from(T.cb).select("*").eq("periodo_id", p.id));
+        const pagos = await sq(sb.from(T.pg).select("*").eq("periodo_id", p.id));
+        let viajes = await sq(sb.from(T.vj).select("*").eq("periodo_id", p.id));
+        if (!viajes.length && p.alquiler_id) {
+            viajes = await sq(sb.from(T.vj).select("*").eq("alquiler_id", p.alquiler_id));
+        }
+        res.json({
+            ...p,
+            tipo_documento: p.tipo_documento || cta?.tipo_documento || null,
+            cliente_id: cta?.cliente_id || null,
+            cliente_nombre: cli?.nombre || "",
+            cliente_tel: cli?.telefono || cta?.telefono || null,
+            cliente_direccion: cli?.direccion || null,
+            obra: obra?.direccion || obra?.nombre || null,
+            remitos: remitos.map(r => ({ ...r, items: byRem[r.id] || [] })),
+            saldos,
+            cobros,
+            pagos,
+            viajes
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/remitos", authMiddleware, async (req, res) => {
+    try {
+        const { alquiler_id } = req.query;
+        let q = sb.from(T.re).select("*").order("id", { ascending: false });
+        if (alquiler_id) q = q.eq("alquiler_id", alquiler_id);
+        const remitos = await sq(q);
+        const items = remitos.length
+            ? await sq(sb.from(T.ri).select(`*, art:${T.ar}!articulo_id(nombre, referencia)`).in("remito_id", remitos.map(r => r.id)))
+            : [];
+        const byRem = {};
+        for (const it of items) {
+            (byRem[it.remito_id] = byRem[it.remito_id] || []).push({
+                ...it,
+                nombre: it.art?.nombre, referencia: it.art?.referencia, art: undefined
+            });
+        }
+        res.json(remitos.map(r => ({ ...r, items: byRem[r.id] || [] })));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/pagos", authMiddleware, async (req, res) => {
+    try {
+        const { cliente_id, alquiler_id } = req.query;
+        let q = sb.from(T.pg)
+            .select(`*, cli:${T.cl}!cliente_id(nombre)`)
+            .order("id", { ascending: false });
+        if (cliente_id) q = q.eq("cliente_id", cliente_id);
+        if (alquiler_id) q = q.eq("alquiler_id", alquiler_id);
+        const rows = await sq(q);
+        res.json(rows.map(p => ({ ...p, cliente_nombre: p.cli?.nombre, cli: undefined })));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/pagos", authMiddleware, async (req, res) => {
+    try {
+        const { cliente_id, alquiler_id, fecha, monto, medio, detalle, tipo } = req.body;
+        if (!monto) return res.status(400).send("Monto requerido");
+        const r = await sqInsert(T.pg, {
+            cliente_id: cliente_id || null, alquiler_id: alquiler_id || null,
+            fecha: fecha || new Date().toISOString().slice(0, 10),
+            monto: parseFloat(monto) || 0, medio: medio || null,
+            detalle: detalle || null, tipo: tipo || "pago"
+        });
+        res.json({ id: r.lastID });
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+app.post("/flujo", authMiddleware, async (req, res) => {
+    try {
+        const { fecha, detalle, valor, tipo, medio } = req.body || {};
+        const det = String(detalle || "").trim();
+        if (!det) return res.status(400).send("Detalle requerido");
+        const v = parseFloat(valor);
+        if (!Number.isFinite(v) || v === 0) return res.status(400).send("Valor requerido");
+        const tipoOk = ["ingreso", "egreso", "traslado"].includes(tipo) ? tipo : "ingreso";
+        const f = fecha || hoyYmd();
+        const anio = parseInt(String(f).slice(0, 4), 10) || new Date().getFullYear();
+        const mes = parseInt(String(f).slice(5, 7), 10) || (new Date().getMonth() + 1);
+        const r = await sqInsert(T.fl, {
+            fecha: f,
+            detalle: det,
+            valor: Math.abs(v),
+            tipo: tipoOk,
+            medio: medio || null,
+            mes,
+            anio,
+            fuente: "manual"
+        });
+        res.json({ id: r.lastID });
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+app.delete("/flujo/:id", authMiddleware, async (req, res) => {
+    try {
+        const row = await sqOne(sb.from(T.fl).select("id, fuente").eq("id", req.params.id));
+        if (!row) return res.status(404).send("Movimiento no encontrado");
+        if (row.fuente && row.fuente !== "manual") {
+            return res.status(400).send("Solo se pueden borrar movimientos añadidos a mano");
+        }
+        await sqDelete(T.fl, req.params.id);
+        res.json({ msg: "Eliminado" });
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+app.get("/flujo", authMiddleware, async (req, res) => {
+    try {
+        const { anio, mes, tipo, buscar } = req.query;
+        let q = sb.from(T.fl).select("*").order("id", { ascending: false });
+        if (anio) q = q.eq("anio", parseInt(anio));
+        if (mes) q = q.eq("mes", parseInt(mes));
+        if (tipo) q = q.eq("tipo", tipo);
+        let rows = await sq(q);
+        if (buscar) {
+            const b = buscar.toLowerCase();
+            rows = rows.filter(r => (r.detalle || "").toLowerCase().includes(b));
+        }
+        const tot = { ingreso: 0, egreso: 0, traslado: 0 };
+        for (const r of rows) tot[r.tipo] = (tot[r.tipo] || 0) + (r.valor || 0);
+        res.json({ detalle: rows, totales: tot });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/documentos", authMiddleware, async (req, res) => {
+    try {
+        const { tipo, dominio, q: buscar } = req.query;
+        let q = sb.from(T.doc).select("*").order("id", { ascending: false });
+        if (tipo) q = q.eq("tipo", tipo);
+        if (dominio) q = q.eq("dominio", dominio);
+        let rows = await sq(q);
+        if (buscar) {
+            const b = buscar.toLowerCase();
+            rows = rows.filter(r => (r.titulo || "").toLowerCase().includes(b) || (r.archivo || "").toLowerCase().includes(b));
+        }
+        res.json(rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/cotizaciones", authMiddleware, async (req, res) => {
+    try {
+        const rows = await sq(sb.from(T.co)
+            .select(`*, cli:${T.cl}!cliente_id(nombre, telefono)`)
+            .order("id", { ascending: false }));
+        res.json(rows.map(c => ({
+            ...c, cliente_nombre: c.cli?.nombre, cliente_tel: c.cli?.telefono, cli: undefined
+        })));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/cotizaciones/:id/items", authMiddleware, async (req, res) => {
+    try {
+        const rows = await sq(sb.from(T.ci)
+            .select(`*, art:${T.ar}!articulo_id(nombre, referencia)`)
+            .eq("cotizacion_id", req.params.id));
+        res.json(rows.map(i => ({
+            ...i, nombre: i.art?.nombre, referencia: i.art?.referencia, art: undefined
+        })));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/archivos/*rel", authMiddleware, (req, res) => {
+    const rel = decodeURIComponent(String(req.params.rel || "").replace(/^\/+/, ""));
+    const root = path.resolve(DATA_DIR);
+    const abs = path.resolve(root, rel);
+    if (!abs.startsWith(root)) return res.status(400).send("Ruta invalida");
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return res.status(404).send("No encontrado");
+    res.download(abs);
+});
+
 // ── BACKUP ────────────────────────────────────────────
 app.post("/backup", authMiddleware, adminOnly, (req, res) => {
-    res.json({ msg: "Supabase gestiona backups automaticos en la nube. Ve a tu proyecto → Settings → Backups." });
+    res.json({ msg: supabaseConfigured
+        ? "Supabase gestiona backups automaticos en la nube. Ve a tu proyecto → Settings → Backups."
+        : "Datos locales en data/store.json. Regenerar: node build_canon_2026.js && node import_canon.js" });
 });
 app.get("/backup/list", authMiddleware, adminOnly, (req, res) => {
     res.json([]);

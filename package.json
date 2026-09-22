@@ -5,6 +5,11 @@
   "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "import-data": "node import_canon.js",
+    "build-canon": "node build_canon_2026.js",
+    "import-canon": "node import_canon.js",
+    "upload-supabase": "node upload_store_to_supabase.js",
+    "excel-to-csv": "node export_excel_to_csv.js",
     "start": "node server.js"
   },
   "keywords": [],

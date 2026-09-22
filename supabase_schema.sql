@@ -398,3 +398,210 @@ BEGIN
     );
 END;
 $$;
+
+-- ════════════════════════════════════════════════════════════
+--  Extensiones para integrar Equioriente_Data
+--  (remitos, fiscal/no fiscal, pagos, caja, documentos, cotizaciones)
+-- ════════════════════════════════════════════════════════════
+
+ALTER TABLE equioriente_articulos
+    ADD COLUMN IF NOT EXISTS valor_unitario FLOAT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS stock_alquilado INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS stock_subalquilado INTEGER DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS dias_minimos INTEGER DEFAULT 1;
+
+ALTER TABLE equioriente_alquileres
+    ADD COLUMN IF NOT EXISTS tipo_fiscal TEXT DEFAULT 'seguimiento', -- fiscal|no_fiscal|seguimiento
+    ADD COLUMN IF NOT EXISTS obra TEXT,
+    ADD COLUMN IF NOT EXISTS periodo TEXT,
+    ADD COLUMN IF NOT EXISTS fuente_archivo TEXT,
+    ADD COLUMN IF NOT EXISTS fuente_hoja TEXT,
+    ADD COLUMN IF NOT EXISTS transporte FLOAT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_cobrado FLOAT DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS equioriente_remitos (
+    id          BIGSERIAL PRIMARY KEY,
+    alquiler_id BIGINT REFERENCES equioriente_alquileres(id) ON DELETE CASCADE,
+    numero      TEXT,
+    fecha       TEXT,
+    hora        TEXT,
+    transporte  FLOAT DEFAULT 0,
+    placa       TEXT,
+    fuente      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_remitos_alq ON equioriente_remitos(alquiler_id);
+CREATE INDEX IF NOT EXISTS idx_equioriente_remitos_num ON equioriente_remitos(numero);
+
+CREATE TABLE IF NOT EXISTS equioriente_remito_items (
+    id              BIGSERIAL PRIMARY KEY,
+    remito_id       BIGINT NOT NULL REFERENCES equioriente_remitos(id) ON DELETE CASCADE,
+    articulo_id     BIGINT REFERENCES equioriente_articulos(id),
+    cantidad        INTEGER NOT NULL,
+    material_origen TEXT
+);
+
+CREATE TABLE IF NOT EXISTS equioriente_pagos (
+    id          BIGSERIAL PRIMARY KEY,
+    cliente_id  BIGINT REFERENCES equioriente_clientes(id),
+    alquiler_id BIGINT REFERENCES equioriente_alquileres(id),
+    fecha       TEXT,
+    monto       FLOAT NOT NULL DEFAULT 0,
+    medio       TEXT,
+    detalle     TEXT,
+    tipo        TEXT DEFAULT 'pago', -- abono|pago|deposito
+    fuente      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_pagos_cli ON equioriente_pagos(cliente_id);
+
+CREATE TABLE IF NOT EXISTS equioriente_flujo_caja (
+    id      BIGSERIAL PRIMARY KEY,
+    fecha   TEXT,
+    detalle TEXT,
+    valor   FLOAT NOT NULL DEFAULT 0,
+    tipo    TEXT NOT NULL DEFAULT 'ingreso', -- ingreso|egreso|traslado
+    medio   TEXT,
+    mes     INTEGER,
+    anio    INTEGER,
+    fuente  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_flujo_fecha ON equioriente_flujo_caja(fecha);
+
+CREATE TABLE IF NOT EXISTS equioriente_documentos (
+    id        BIGSERIAL PRIMARY KEY,
+    tipo      TEXT,
+    titulo    TEXT,
+    archivo   TEXT,
+    ruta      TEXT,
+    extension TEXT,
+    anio      INTEGER,
+    mes       INTEGER,
+    tamano    BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS equioriente_cotizaciones (
+    id             BIGSERIAL PRIMARY KEY,
+    cliente_id     BIGINT REFERENCES equioriente_clientes(id),
+    fecha          TEXT,
+    estado         TEXT DEFAULT 'abierta',
+    total          FLOAT DEFAULT 0,
+    transporte     FLOAT DEFAULT 0,
+    notas          TEXT,
+    fuente_archivo TEXT,
+    fuente_hoja    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS equioriente_cotizacion_items (
+    id              BIGSERIAL PRIMARY KEY,
+    cotizacion_id   BIGINT NOT NULL REFERENCES equioriente_cotizaciones(id) ON DELETE CASCADE,
+    articulo_id     BIGINT REFERENCES equioriente_articulos(id),
+    cantidad        INTEGER,
+    dias            INTEGER,
+    valor_unitario  FLOAT,
+    total           FLOAT
+);
+
+-- ════════════════════════════════════════════════════════════
+--  Dominios 2026 (catálogo / personas / operación / caja / archivo)
+-- ════════════════════════════════════════════════════════════
+
+ALTER TABLE equioriente_alquileres
+    ADD COLUMN IF NOT EXISTS periodo_id BIGINT;
+
+ALTER TABLE equioriente_pagos
+    ADD COLUMN IF NOT EXISTS periodo_id BIGINT;
+
+ALTER TABLE equioriente_remitos
+    ADD COLUMN IF NOT EXISTS periodo_id BIGINT;
+
+ALTER TABLE equioriente_documentos
+    ADD COLUMN IF NOT EXISTS dominio TEXT DEFAULT 'documento'; -- informe|documento|historico|operacion
+
+ALTER TABLE equioriente_alquiler_items
+    ADD COLUMN IF NOT EXISTS material_origen TEXT;
+
+CREATE TABLE IF NOT EXISTS equioriente_obras (
+    id         BIGSERIAL PRIMARY KEY,
+    cliente_id BIGINT NOT NULL REFERENCES equioriente_clientes(id),
+    nombre     TEXT,
+    direccion  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_obras_cli ON equioriente_obras(cliente_id);
+
+CREATE TABLE IF NOT EXISTS equioriente_cuentas (
+    id              BIGSERIAL PRIMARY KEY,
+    cliente_id      BIGINT NOT NULL REFERENCES equioriente_clientes(id),
+    obra_id         BIGINT REFERENCES equioriente_obras(id),
+    tipo_documento  TEXT NOT NULL DEFAULT 'seguimiento', -- seguimiento|fiscal|no_fiscal
+    telefono        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_cuentas_cli ON equioriente_cuentas(cliente_id);
+
+CREATE TABLE IF NOT EXISTS equioriente_periodos_cuenta (
+    id            BIGSERIAL PRIMARY KEY,
+    cuenta_id     BIGINT NOT NULL REFERENCES equioriente_cuentas(id) ON DELETE CASCADE,
+    alquiler_id   BIGINT REFERENCES equioriente_alquileres(id),
+    anio_mes      TEXT NOT NULL, -- YYYY-MM
+    fuente        TEXT,
+    hoja          TEXT,
+    notas         TEXT,
+    transporte    FLOAT DEFAULT 0,
+    total_cobrado FLOAT DEFAULT 0,
+    remitos_n     INTEGER DEFAULT 0,
+    saldos_n      INTEGER DEFAULT 0,
+    estado        TEXT DEFAULT 'activo', -- activo|cerrado
+    tipo_documento TEXT
+);
+ALTER TABLE equioriente_periodos_cuenta
+    ADD COLUMN IF NOT EXISTS tipo_documento TEXT;
+CREATE INDEX IF NOT EXISTS idx_equioriente_periodos_mes ON equioriente_periodos_cuenta(anio_mes);
+CREATE INDEX IF NOT EXISTS idx_equioriente_periodos_cta ON equioriente_periodos_cuenta(cuenta_id);
+
+CREATE TABLE IF NOT EXISTS equioriente_movimientos (
+    id          BIGSERIAL PRIMARY KEY,
+    remito_id   BIGINT NOT NULL REFERENCES equioriente_remitos(id) ON DELETE CASCADE,
+    articulo_id BIGINT REFERENCES equioriente_articulos(id),
+    material    TEXT,
+    cantidad    FLOAT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_mov_remito ON equioriente_movimientos(remito_id);
+
+CREATE TABLE IF NOT EXISTS equioriente_saldos_periodo (
+    id          BIGSERIAL PRIMARY KEY,
+    periodo_id  BIGINT NOT NULL REFERENCES equioriente_periodos_cuenta(id) ON DELETE CASCADE,
+    articulo_id BIGINT REFERENCES equioriente_articulos(id),
+    material    TEXT,
+    cantidad    FLOAT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_saldos_per ON equioriente_saldos_periodo(periodo_id);
+
+CREATE TABLE IF NOT EXISTS equioriente_cobros (
+    id              BIGSERIAL PRIMARY KEY,
+    periodo_id      BIGINT NOT NULL REFERENCES equioriente_periodos_cuenta(id) ON DELETE CASCADE,
+    articulo_id     BIGINT REFERENCES equioriente_articulos(id),
+    material        TEXT,
+    dias            FLOAT DEFAULT 1,
+    cantidad        FLOAT DEFAULT 0,
+    valor_unitario  FLOAT DEFAULT 0,
+    costo_diario    FLOAT DEFAULT 0,
+    total           FLOAT DEFAULT 0,
+    periodo_texto   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_cobros_per ON equioriente_cobros(periodo_id);
+
+-- Viajes de camión (llevada / recogida). Sin km: precio cobrado y quién lo hace.
+CREATE TABLE IF NOT EXISTS equioriente_viajes (
+    id           BIGSERIAL PRIMARY KEY,
+    alquiler_id  BIGINT REFERENCES equioriente_alquileres(id) ON DELETE CASCADE,
+    periodo_id   BIGINT REFERENCES equioriente_periodos_cuenta(id) ON DELETE SET NULL,
+    remito_id    BIGINT REFERENCES equioriente_remitos(id) ON DELETE SET NULL,
+    tipo         TEXT NOT NULL DEFAULT 'llevada', -- llevada|recogida|ida_vuelta
+    quien        TEXT NOT NULL DEFAULT 'equioriente', -- equioriente|cliente
+    precio       FLOAT DEFAULT 0,
+    placa        TEXT,
+    direccion    TEXT,
+    fecha        TEXT,
+    notas        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equioriente_viajes_alq ON equioriente_viajes(alquiler_id);
+CREATE INDEX IF NOT EXISTS idx_equioriente_viajes_per ON equioriente_viajes(periodo_id);
+CREATE INDEX IF NOT EXISTS idx_equioriente_viajes_fecha ON equioriente_viajes(fecha);

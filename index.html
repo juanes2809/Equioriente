@@ -243,11 +243,14 @@ tr:last-child td { border-bottom: none; }
   display: flex; align-items: center; justify-content: center; z-index: 100; padding: 20px;
   animation: fadeIn 0.2s ease-out;
 }
+#modalFicha, #modalDevolucion { z-index: 110; }
+#confirmModal { z-index: 120; }
 .modal {
   background: var(--card-bg); border-radius: 20px; padding: 32px; width: 100%; max-width: 600px;
   max-height: 90vh; overflow-y: auto; border: 1px solid var(--card-border);
   box-shadow: 0 20px 40px rgba(0,0,0,0.1); animation: scaleUpFade 0.3s cubic-bezier(0.16,1,0.3,1);
 }
+.modal.modal-wide { max-width: 920px; }
 @keyframes scaleUpFade { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
 .modal h3 { color: var(--text-main); margin-bottom: 24px; font-size: 1.25rem; font-weight: 700; }
 .modal-actions { display: flex; gap: 12px; margin-top: 28px; justify-content: flex-end; }
@@ -361,6 +364,11 @@ tr:last-child td { border-bottom: none; }
   margin-bottom: 24px;
 }
 .xlsx-bar > span { font-size: 0.95rem; color: #065f46; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+.stat-card { background: #f8fafc; border: 1px solid var(--card-border); border-radius: 8px; padding: 14px; }
+.stat-value { font-size: 1.3rem; font-weight: 800; color: var(--text-main); }
+.stat-label { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -403,6 +411,8 @@ tr:last-child td { border-bottom: none; }
     <button id="btnCli" onclick="tab('clientes')">Clientes</button>
     <button id="btnProv" onclick="tab('proveedores')">Proveedores</button>
     <button id="btndaños" onclick="tab('daños')">Daños/Perdidas</button>
+    <button id="btnCaja" onclick="tab('caja')">Caja</button>
+    <button id="btnDocs" onclick="tab('documentos')">Documentos</button>
     <button id="btnReportes" onclick="tab('reportes')">Reportes</button>
     <button id="btnHist" onclick="tab('historial')">Historial</button>
     <button id="btnBackup" onclick="tab('backup')" class="admin-only">Backup</button>
@@ -438,6 +448,7 @@ tr:last-child td { border-bottom: none; }
           <div><div class="kpi-value" id="kpiStockBajo">—</div><div class="kpi-label">Alertas Stock Bajo</div></div>
         </div>
       </div>
+      <div id="dashImportMeta" class="info-strip" style="margin-bottom:20px">Cargando resumen de Equioriente_Data...</div>
 
       <div class="dash-cols">
         <div class="card" style="margin-bottom:0">
@@ -455,17 +466,31 @@ tr:last-child td { border-bottom: none; }
     <div id="alquileres" class="tab">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
         <div>
-          <h3 style="font-size:1.1rem;color:var(--primary)">Alquileres Activos</h3>
-          <p style="color:var(--muted);font-size:.85rem">Material actualmente fuera</p>
+          <h3 style="font-size:1.1rem;color:var(--primary)">Operación por mes</h3>
+          <p style="color:var(--muted);font-size:.85rem">Cuentas 2026: remitos, saldo en obra y cobro del periodo</p>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <select id="filtroMesAlq" onchange="renderActiveRentals()" style="width:160px;padding:8px">
+            <option value="">Todos los meses</option>
+            <option value="2026-09" selected>Septiembre 2026</option>
+            <option value="2026-07">Julio 2026</option>
+            <option value="2026-06">Junio 2026</option>
+            <option value="2026-05">Mayo 2026</option>
+            <option value="2026-02">Febrero 2026</option>
+          </select>
           <select id="filtroEstadoAlq" onchange="renderActiveRentals()" style="width:140px;padding:8px">
-            <option value="activo,parcial">Activos + Parciales</option>
-            <option value="activo">Solo activos</option>
-            <option value="parcial">Solo parciales</option>
+            <option value="">Todos los estados</option>
+            <option value="activo">Con saldo en obra</option>
+            <option value="cerrado">Cerrados</option>
+          </select>
+          <select id="filtroFiscalAlq" onchange="renderActiveRentals()" style="width:150px;padding:8px">
+            <option value="">Fiscal y no fiscal</option>
+            <option value="fiscal">Solo fiscal</option>
+            <option value="no_fiscal">Solo no fiscal</option>
+            <option value="seguimiento">Solo seguimiento</option>
           </select>
           <div class="search-box" style="width:260px">
-            <input id="searchActive" oninput="renderActiveRentals()" placeholder="Buscar cliente o alquiler...">
+            <input id="searchActive" oninput="renderActiveRentals()" placeholder="Buscar cliente u obra...">
           </div>
         </div>
       </div>
@@ -490,6 +515,17 @@ tr:last-child td { border-bottom: none; }
             <label>Fecha devolucion esperada</label>
             <input type="date" id="fecha_devolucion">
           </div>
+          <div>
+            <label>Tipo documento</label>
+            <select id="alq_tipo_fiscal">
+              <option value="no_fiscal">No fiscal</option>
+              <option value="fiscal">Fiscal</option>
+            </select>
+          </div>
+          <div>
+            <label>Obra / sitio</label>
+            <input id="alq_obra" placeholder="Direccion de la obra">
+          </div>
         </div>
         <div id="clienteInfo" class="info-strip hidden" style="margin-bottom:14px">
           <span>Tel: <b id="ci_tel"></b></span>
@@ -500,6 +536,38 @@ tr:last-child td { border-bottom: none; }
           <label>Notas / Observaciones</label>
           <textarea id="alq_notas" placeholder="Detalles adicionales..."></textarea>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Transporte (camión)</div>
+        <div class="form-grid cols-2" style="margin-bottom:10px">
+          <div>
+            <label>Quién lleva el material</label>
+            <select id="tr_quien" onchange="toggleTransporte()">
+              <option value="equioriente">Equioriente (camión)</option>
+              <option value="cliente">El cliente lo lleva</option>
+            </select>
+          </div>
+          <div id="trPlacaWrap">
+            <label>Placa</label>
+            <input id="tr_placa" placeholder="CWG-768">
+          </div>
+        </div>
+        <div id="trCamionFields" class="form-grid cols-2">
+          <div>
+            <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <input type="checkbox" id="tr_llevada" checked onchange="renderRentalItems()"> Llevada
+            </label>
+            <input type="number" id="tr_llevada_precio" min="0" placeholder="Precio llevada $" oninput="renderRentalItems()">
+          </div>
+          <div>
+            <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <input type="checkbox" id="tr_recogida" onchange="toggleRecogida(); renderRentalItems()"> Recogida (si nosotros recogemos)
+            </label>
+            <input type="number" id="tr_recogida_precio" min="0" placeholder="Precio recogida $" oninput="renderRentalItems()" disabled>
+          </div>
+        </div>
+        <p style="color:var(--muted);font-size:.8rem;margin:8px 0 0">El arriendo del material va aparte. Esto es solo el viaje del camión.</p>
       </div>
 
       <div class="card">
@@ -585,7 +653,7 @@ tr:last-child td { border-bottom: none; }
           <table>
             <thead><tr>
               <th>Ref.</th><th>Nombre</th><th>Cat.</th><th>Tipo</th>
-              <th>Total</th><th>Disp.</th><th>Mant.</th><th>Danado</th><th>Min.</th><th>$/dia</th><th>Acciones</th>
+              <th>Total</th><th>Bodega</th><th>En obra</th><th>Danado</th><th>Min.</th><th>$/dia</th><th>Acciones</th>
             </tr></thead>
             <tbody id="tablaArticulos"></tbody>
           </table>
@@ -769,6 +837,7 @@ tr:last-child td { border-bottom: none; }
         <div class="card-title">Reportes</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
           <button class="btn btn-primary btn-sm" onclick="loadReporte('ingresos')">Ingresos</button>
+          <button class="btn btn-primary btn-sm" onclick="loadReporte('transporte')">Camión / transporte</button>
           <button class="btn btn-primary btn-sm" onclick="loadReporte('articulos-top')">Articulos mas alquilados</button>
           <button class="btn btn-primary btn-sm" onclick="loadReporte('clientes-top')">Mejores clientes</button>
           <button class="btn btn-primary btn-sm" onclick="loadReporte('costos-externos')">Costos externos</button>
@@ -780,12 +849,146 @@ tr:last-child td { border-bottom: none; }
           <div class="form-grid cols-3">
             <div><label>Desde</label><input type="date" id="rep_desde"></div>
             <div><label>Hasta</label><input type="date" id="rep_hasta"></div>
-            <div style="display:flex;align-items:flex-end"><button class="btn btn-ghost btn-sm" onclick="loadReporte('ingresos')">Filtrar</button></div>
+            <div style="display:flex;align-items:flex-end"><button class="btn btn-ghost btn-sm" onclick="loadReporte(window._repTipo || 'ingresos')">Filtrar</button></div>
           </div>
         </div>
 
         <div id="reporteStats" class="stat-grid hidden"></div>
         <div id="reporteContent"></div>
+      </div>
+    </div>
+
+    <!-- CAJA -->
+    <div id="caja" class="tab">
+      <div class="card">
+        <div class="card-title">Añadir movimiento</div>
+        <div class="form-grid cols-3" style="margin-bottom:10px">
+          <div><label>Fecha *</label><input type="date" id="caja_fecha"></div>
+          <div>
+            <label>Tipo *</label>
+            <select id="caja_tipo">
+              <option value="ingreso">Ingreso</option>
+              <option value="egreso">Egreso</option>
+              <option value="traslado">Traslado</option>
+            </select>
+          </div>
+          <div>
+            <label>Medio</label>
+            <input id="caja_medio" list="cajaMedios" placeholder="Nequi, efectivo, BBVA...">
+            <datalist id="cajaMedios">
+              <option value="NEQUI">
+              <option value="EFECTIVO">
+              <option value="BBVA">
+              <option value="BBVA JIMMY">
+              <option value="BBVA EMPRESA">
+              <option value="BANCOLOMBIA">
+              <option value="DAVIPLATA">
+              <option value="TRANSFERENCIA">
+            </datalist>
+          </div>
+        </div>
+        <div class="form-grid cols-2" style="margin-bottom:10px">
+          <div><label>Detalle *</label><input id="caja_detalle" placeholder="Ej: Abono alquiler Andrei junio"></div>
+          <div><label>Valor *</label><input type="number" id="caja_valor" min="1" step="1" placeholder="0"></div>
+        </div>
+        <button class="btn btn-primary" onclick="guardarFlujo()">Añadir a caja</button>
+      </div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+          <div class="card-title" style="margin:0">Flujo de caja</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <select id="flujoAnio" onchange="loadCaja()" style="width:110px;padding:8px">
+              <option value="">Todos</option>
+              <option value="2026" selected>2026</option>
+              <option value="2025">2025</option>
+              <option value="2023">2023</option>
+            </select>
+            <select id="flujoMes" onchange="loadCaja()" style="width:140px;padding:8px">
+              <option value="">Todos los meses</option>
+              <option value="1">Enero</option><option value="2">Febrero</option><option value="3">Marzo</option>
+              <option value="4">Abril</option><option value="5">Mayo</option><option value="6">Junio</option>
+              <option value="7">Julio</option><option value="8">Agosto</option><option value="9" selected>Septiembre</option>
+              <option value="10">Octubre</option><option value="11">Noviembre</option><option value="12">Diciembre</option>
+            </select>
+            <select id="flujoTipo" onchange="loadCaja()" style="width:140px;padding:8px">
+              <option value="">Todos</option>
+              <option value="ingreso">Ingresos</option>
+              <option value="egreso">Egresos</option>
+              <option value="traslado">Traslados</option>
+            </select>
+            <div class="search-box" style="width:200px">
+              <input id="flujoBuscar" oninput="loadCaja()" placeholder="Buscar detalle...">
+            </div>
+          </div>
+        </div>
+        <div id="cajaStats" class="stat-grid" style="margin-bottom:16px"></div>
+        <div class="table-wrap" style="max-height:480px;overflow:auto">
+          <table>
+            <thead><tr><th>Fecha</th><th>Detalle</th><th>Tipo</th><th>Medio</th><th>Valor</th><th></th></tr></thead>
+            <tbody id="tablaFlujo"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Abonos y pagos (desde seguimiento)</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Fecha</th><th>Cliente</th><th>Tipo</th><th>Detalle</th><th>Medio</th><th>Monto</th></tr></thead>
+            <tbody id="tablaPagos"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- DOCUMENTOS -->
+    <div id="documentos" class="tab">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+          <div class="card-title" style="margin:0">Archivo de Equioriente_Data</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <select id="docDominio" onchange="loadDocumentos()" style="width:160px;padding:8px">
+              <option value="">Todos los dominios</option>
+              <option value="informe">Informes</option>
+              <option value="documento">Documentos</option>
+              <option value="historico">Histórico</option>
+              <option value="operacion">Operación 2026</option>
+            </select>
+            <select id="docTipo" onchange="loadDocumentos()" style="width:160px;padding:8px">
+              <option value="">Todos los tipos</option>
+              <option value="acta">Actas</option>
+              <option value="contrato">Contratos</option>
+              <option value="informe">Informes</option>
+              <option value="alquiler">Alquileres Excel</option>
+              <option value="seguimiento">Seguimiento</option>
+              <option value="inventario">Inventario</option>
+              <option value="flujo">Flujo</option>
+              <option value="cotizacion">Cotizaciones</option>
+              <option value="documento">Otros docs</option>
+            </select>
+            <div class="search-box" style="width:220px">
+              <input id="docBuscar" oninput="loadDocumentos()" placeholder="Buscar archivo...">
+            </div>
+          </div>
+        </div>
+        <p style="color:var(--text-muted);font-size:.85rem;margin-bottom:12px">
+          Actas, P&amp;G, 2023/2025 e informes viven aquí. No se cargan como artículos ni como alquileres.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Dominio</th><th>Tipo</th><th>Titulo</th><th>Año</th><th>Archivo</th><th></th></tr></thead>
+            <tbody id="tablaDocumentos"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Cotizaciones</div>
+        <p style="color:var(--text-muted);font-size:.85rem;margin-bottom:12px">Las cotizaciones 2023 están en el archivo histórico, no como operación 2026.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Cliente</th><th>Hoja</th><th>Transporte</th><th>Total</th><th>Estado</th></tr></thead>
+            <tbody id="tablaCotizaciones"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -879,10 +1082,42 @@ tr:last-child td { border-bottom: none; }
     <h3>Devolucion de Alquiler <span id="mdAlqId"></span></h3>
     <p style="color:var(--muted);font-size:.85rem;margin-bottom:16px">Selecciona las cantidades a devolver por articulo.</p>
     <div id="mdItems"></div>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+      <label style="display:flex;align-items:center;gap:8px;font-weight:600">
+        <input type="checkbox" id="md_recoge" onchange="document.getElementById('mdRecogidaFields').classList.toggle('hidden', !this.checked)">
+        Equioriente recoge (camión)
+      </label>
+      <div id="mdRecogidaFields" class="form-grid cols-2 hidden" style="margin-top:10px">
+        <div><label>Precio recogida ($)</label><input type="number" id="md_rec_precio" min="0" placeholder="0"></div>
+        <div><label>Placa</label><input id="md_rec_placa" placeholder="CWG-768"></div>
+      </div>
+    </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModalDevolucion()">Cancelar</button>
       <button class="btn btn-success" onclick="confirmarDevolucionParcial()">Devolver Todo</button>
       <button class="btn btn-warn" onclick="confirmarDevolucionParcial(true)">Devolucion Parcial</button>
+    </div>
+  </div>
+</div>
+
+<div id="modalClienteFicha" class="modal-overlay hidden">
+  <div class="modal modal-wide">
+    <h3 id="cliFichaTitulo">Cliente</h3>
+    <p id="cliFichaMeta" style="color:var(--muted);font-size:.85rem;margin-bottom:16px"></p>
+    <div id="cliFichaBody"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeClienteFicha()">Cerrar</button>
+    </div>
+  </div>
+</div>
+
+<div id="modalFicha" class="modal-overlay hidden">
+  <div class="modal modal-wide">
+    <h3 id="fichaTitulo">Ficha de cliente</h3>
+    <p id="fichaMeta" style="color:var(--muted);font-size:.85rem;margin-bottom:16px"></p>
+    <div id="fichaBody"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeFicha()">Cerrar</button>
     </div>
   </div>
 </div>
@@ -896,6 +1131,7 @@ let authToken = null;
 let articulos = [], clientes = [], categorias = [], alquileres = [], historialData = [];
 let rentalItems = [];
 let devolucionAlqId = null;
+let fichaActual = null;
 
 // ═══════════════════════════════════════
 //  TOAST
@@ -945,9 +1181,10 @@ async function loadDashboard() {
   const desde30 = new Date(today); desde30.setDate(desde30.getDate() - 30);
   const fmt = d => d.toISOString().substr(0, 10);
 
+  const mesDash = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
   const [activos, parciales, morosos, alertas, ingresos] = await Promise.all([
-    api("/alquileres?estado=activo").then(r => r.json()),
-    api("/alquileres?estado=parcial").then(r => r.json()),
+    api("/periodos?estado=activo&anio_mes=" + mesDash).then(r => r.json()),
+    api("/alquileres?estado=parcial").then(r => r.json()).catch(() => []),
     api("/reportes/morosos").then(r => r.json()),
     api("/articulos/alertas").then(r => r.json()),
     api(`/reportes/ingresos?desde=${fmt(desde30)}&hasta=${fmt(today)}`).then(r => r.json())
@@ -980,7 +1217,7 @@ async function loadDashboard() {
         : '<span class="badge badge-green">Activo</span>';
       return `<div class="dash-list-item">
         <div>
-          <span class="badge badge-blue">#${String(a.id).padStart(4,"0")}</span>
+          <span class="badge badge-blue">${a.anio_mes || ""}</span>
           <b style="margin-left:6px">${a.cliente_nombre}</b>
         </div>
         ${badge}
@@ -1000,6 +1237,20 @@ async function loadDashboard() {
   }
 
   updateNavBadges(morosos.length, alertas.length);
+
+  try {
+    const meta = await api("/datos/meta").then(r => r.json());
+    const s = meta.stats || meta.conteos || {};
+    const el = document.getElementById("dashImportMeta");
+    if (el) el.innerHTML = `<b>Datos conjuntos:</b>
+      ${s.articulos || meta.conteos?.articulos || 0} articulos (inventario) ·
+      ${s.clientes || meta.conteos?.clientes || 0} clientes ·
+      ${s.periodos || meta.conteos?.periodos || s.alquileres || meta.conteos?.alquileres || 0} cuentas/mes ·
+      ${s.remitos || meta.conteos?.remitos || 0} remitos ·
+      ${s.flujo || meta.conteos?.flujo || 0} movimientos de caja ·
+      ${s.documentos || meta.conteos?.documentos || 0} archivos
+      <span style="margin-left:8px;opacity:.8">${meta.imported_at ? ("Importado " + String(meta.imported_at).slice(0,16).replace("T"," ")) : ""}</span>`;
+  } catch { /* ignore */ }
 }
 
 // ═══════════════════════════════════════
@@ -1073,8 +1324,8 @@ function tab(id) {
   document.getElementById(id).classList.add("active");
   const map = {
     dashboard: "btnDash", alquileres: "btnAlq", nuevo: "btnNuevo", articulos: "btnArt",
-    clientes: "btnCli", proveedores: "btnProv", daños: "btndaños", reportes: "btnReportes",
-    historial: "btnHist", backup: "btnBackup"
+    clientes: "btnCli", proveedores: "btnProv", daños: "btndaños", caja: "btnCaja",
+    documentos: "btnDocs", reportes: "btnReportes", historial: "btnHist", backup: "btnBackup"
   };
   if (map[id]) document.getElementById(map[id]).classList.add("active");
   if (id === "dashboard") loadDashboard();
@@ -1083,6 +1334,8 @@ function tab(id) {
   if (id === "historial") { loadHistorial(); loadMovimientos(); }
   if (id === "proveedores") loadProveedores();
   if (id === "daños") loaddaños();
+  if (id === "caja") loadCaja();
+  if (id === "documentos") loadDocumentos();
   if (id === "backup") loadBackups();
 }
 
@@ -1240,7 +1493,7 @@ function renderArticulos() {
       <td>${tipoBadge}</td>
       <td>${a.stock_total}</td>
       <td><span class="badge ${dispColor}">${a.stock_disponible}</span></td>
-      <td>${a.stock_mantenimiento || 0}</td>
+      <td>${a.stock_alquilado || a.stock_mantenimiento || 0}</td>
       <td>${a.stock_danado || 0}</td>
       <td>${a.stock_minimo || '-'}</td>
       <td>$${Number(a.precio_dia).toLocaleString()}</td>
@@ -1294,13 +1547,93 @@ function renderClientes() {
     return;
   }
   tbody.innerHTML = lista.map(c => `<tr>
-    <td><b>${c.nombre}</b></td>
-    <td>${c.identificacion || '-'}</td>
-    <td>${c.telefono || '-'}</td>
-    <td>${c.direccion || '-'}</td>
-    <td><button class="btn btn-ghost btn-sm" onclick="eliminarCliente(${c.id})">Borrar</button></td>
-    <td><button class="btn btn-success btn-sm" onclick="exportarCliente(${c.id}, '${c.nombre.replace(/'/g,"\\'")}')">📥 XLSX</button></td>
+    <td><b style="cursor:pointer;color:var(--primary)" onclick="abrirCliente(${c.id})">${escHtml(c.nombre)}</b></td>
+    <td>${escHtml(c.identificacion || '-')}</td>
+    <td>${escHtml(c.telefono || '-')}</td>
+    <td>${escHtml(c.direccion || '-')}</td>
+    <td>
+      <button class="btn btn-primary btn-sm" onclick="abrirCliente(${c.id})">Ver</button>
+      <button class="btn btn-ghost btn-sm" onclick="eliminarCliente(${c.id})">Borrar</button>
+    </td>
+    <td><button class="btn btn-success btn-sm" onclick="exportarCliente(${c.id}, '${String(c.nombre || "").replace(/'/g,"\\'")}')">📥 XLSX</button></td>
   </tr>`).join("");
+}
+
+async function abrirCliente(id) {
+  const c = await api("/clientes/" + id).then(r => r.json());
+  if (!c || c.error) return toast("No se pudo cargar el cliente", "error");
+  document.getElementById("cliFichaTitulo").textContent = c.nombre || "Cliente";
+  document.getElementById("cliFichaMeta").textContent =
+    [c.identificacion, c.telefono, c.direccion].filter(Boolean).join(" · ");
+  const periodos = c.periodos || [];
+  const periodoAlq = new Set(periodos.map(p => p.alquiler_id).filter(Boolean));
+  const sueltos = (c.alquileres || []).filter(a => !periodoAlq.has(a.id));
+  const pagos = c.pagos || [];
+  const cobroTotal = periodos.reduce((s, p) => s + (Number(p.total_cobrado) || 0), 0);
+  const pagoTotal = pagos.reduce((s, p) => s + (Number(p.monto) || 0), 0);
+  let html = `<div class="stat-grid" style="margin-bottom:16px">
+    <div class="stat-card"><div class="stat-value">${periodos.length + sueltos.length}</div><div class="stat-label">Alquileres</div></div>
+    <div class="stat-card"><div class="stat-value">${fmtMoney(cobroTotal)}</div><div class="stat-label">Cobrado</div></div>
+    <div class="stat-card"><div class="stat-value">${fmtMoney(pagoTotal)}</div><div class="stat-label">Abonos / pagos</div></div>
+  </div>`;
+  if (!periodos.length && !sueltos.length) {
+    html += `<p style="color:var(--muted);text-align:center;padding:24px">Este cliente no tiene alquileres</p>`;
+  } else {
+    html += `<div class="table-wrap"><table>
+      <thead><tr><th>Mes</th><th>Obra</th><th>Tipo</th><th>Estado</th><th>Remitos</th><th>Cobro</th><th>Transporte</th><th></th></tr></thead>
+      <tbody>`;
+    html += periodos.map(p => {
+      const tipo = p.tipo_documento || "";
+      const badge = tipo === "fiscal" ? "badge-green" : tipo === "no_fiscal" ? "badge-purple" : "badge-gray";
+      const est = p.estado === "activo" ? '<span class="badge badge-green">En obra</span>' : '<span class="badge badge-gray">Cerrado</span>';
+      return `<tr>
+        <td><span class="badge badge-blue">${escHtml(p.anio_mes || "")}</span></td>
+        <td>${escHtml(p.obra || "-")}</td>
+        <td><span class="badge ${badge}">${escHtml(tipo || "seguimiento")}</span></td>
+        <td>${est}</td>
+        <td>${p.remitos_n || 0}</td>
+        <td><b>${fmtMoney(p.total_cobrado)}</b></td>
+        <td>${fmtMoney(p.transporte)}</td>
+        <td><button class="btn btn-primary btn-sm" onclick="abrirFicha(${p.id})">Ficha</button></td>
+      </tr>`;
+    }).join("");
+    html += sueltos.map(a => {
+      const est = a.estado === "devuelto"
+        ? '<span class="badge badge-green">Devuelto</span>'
+        : a.estado === "parcial"
+        ? '<span class="badge badge-orange">Parcial</span>'
+        : '<span class="badge badge-green">Activo</span>';
+      return `<tr>
+        <td>${escHtml((a.periodo || a.fecha_salida || "").toString().slice(0, 10))}</td>
+        <td>${escHtml(a.obra || "-")}</td>
+        <td><span class="badge badge-gray">${escHtml(a.tipo_fiscal || "")}</span></td>
+        <td>${est}</td>
+        <td>—</td>
+        <td><b>${fmtMoney(a.total_cobrado)}</b></td>
+        <td>${fmtMoney(a.transporte)}</td>
+        <td>${a.estado !== "devuelto" ? `<button class="btn btn-warn btn-sm" onclick="abrirDevolucion(${a.id})">Devolver</button>` : ""}</td>
+      </tr>`;
+    }).join("");
+    html += `</tbody></table></div>`;
+  }
+  if (pagos.length) {
+    html += `<div class="card-title" style="margin:18px 0 8px">Pagos y abonos</div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Fecha</th><th>Tipo</th><th>Detalle</th><th>Medio</th><th>Monto</th></tr></thead>
+        <tbody>${pagos.map(p => `<tr>
+          <td>${escHtml((p.fecha || "").slice(0, 10) || "-")}</td>
+          <td>${escHtml(p.tipo || "pago")}</td>
+          <td>${escHtml(p.detalle || "")}</td>
+          <td>${escHtml(p.medio || "-")}</td>
+          <td><b>${fmtMoney(p.monto)}</b></td>
+        </tr>`).join("")}</tbody>
+      </table></div>`;
+  }
+  document.getElementById("cliFichaBody").innerHTML = html;
+  document.getElementById("modalClienteFicha").classList.remove("hidden");
+}
+function closeClienteFicha() {
+  document.getElementById("modalClienteFicha").classList.add("hidden");
 }
 
 // ═══════════════════════════════════════
@@ -1380,6 +1713,49 @@ function removeRentalItem(idx) {
   renderRentalItems();
 }
 
+function toggleTransporte() {
+  const eq = document.getElementById("tr_quien").value === "equioriente";
+  document.getElementById("trCamionFields").style.display = eq ? "" : "none";
+  document.getElementById("trPlacaWrap").style.display = eq ? "" : "none";
+  renderRentalItems();
+}
+function toggleRecogida() {
+  const on = document.getElementById("tr_recogida").checked;
+  document.getElementById("tr_recogida_precio").disabled = !on;
+}
+function viajesDesdeFormulario() {
+  const quien = document.getElementById("tr_quien").value;
+  const obra = document.getElementById("alq_obra").value || null;
+  const placa = document.getElementById("tr_placa").value.trim() || null;
+  if (quien === "cliente") {
+    return [{ tipo: "llevada", quien: "cliente", precio: 0, placa: null, direccion: obra }];
+  }
+  const viajes = [];
+  if (document.getElementById("tr_llevada").checked) {
+    const precio = parseFloat(document.getElementById("tr_llevada_precio").value) || 0;
+    if (precio > 0) {
+      viajes.push({ tipo: "llevada", quien: "equioriente", precio, placa, direccion: obra });
+    }
+  }
+  if (document.getElementById("tr_recogida").checked) {
+    const precio = parseFloat(document.getElementById("tr_recogida_precio").value) || 0;
+    if (precio > 0) {
+      viajes.push({ tipo: "recogida", quien: "equioriente", precio, placa, direccion: obra });
+    }
+  }
+  return viajes;
+}
+function resetTransporteForm() {
+  document.getElementById("tr_quien").value = "equioriente";
+  document.getElementById("tr_llevada").checked = true;
+  document.getElementById("tr_recogida").checked = false;
+  document.getElementById("tr_llevada_precio").value = "";
+  document.getElementById("tr_recogida_precio").value = "";
+  document.getElementById("tr_placa").value = "";
+  toggleRecogida();
+  toggleTransporte();
+}
+
 function renderRentalItems() {
   const body = document.getElementById("itemsBody");
   if (!rentalItems.length) {
@@ -1400,6 +1776,12 @@ function renderRentalItems() {
     </div>`;
   }).join("");
   document.getElementById("totalEstimado").textContent = `Total estimado: $${total.toLocaleString()}`;
+  const viajes = typeof viajesDesdeFormulario === "function" ? viajesDesdeFormulario() : [];
+  const trans = viajes.filter(v => v.quien === "equioriente").reduce((s, v) => s + (Number(v.precio) || 0), 0);
+  if (trans) {
+    document.getElementById("totalEstimado").textContent =
+      `Material: $${total.toLocaleString()}  ·  Transporte: $${trans.toLocaleString()}  ·  Total: $${(total + trans).toLocaleString()}`;
+  }
 }
 
 async function registrarAlquiler() {
@@ -1412,6 +1794,9 @@ async function registrarAlquiler() {
     usuario_id: currentUser.id,
     fecha_devolucion_esperada: document.getElementById("fecha_devolucion").value || null,
     notas: document.getElementById("alq_notas").value,
+    tipo_fiscal: document.getElementById("alq_tipo_fiscal").value || "no_fiscal",
+    obra: document.getElementById("alq_obra").value || null,
+    viajes: viajesDesdeFormulario(),
     items: rentalItems.map(i => ({
       articulo_id: i.articulo_id, cantidad: i.cantidad,
       precio_dia_aplicado: i.precio_dia_aplicado, dias_acordados: i.dias_acordados
@@ -1429,6 +1814,8 @@ async function registrarAlquiler() {
   document.getElementById("clienteInfo").classList.add("hidden");
   document.getElementById("alq_notas").value = "";
   document.getElementById("fecha_devolucion").value = "";
+  document.getElementById("alq_obra").value = "";
+  resetTransporteForm();
   await loadAll();
   tab("alquileres");
 }
@@ -1438,68 +1825,177 @@ async function registrarAlquiler() {
 // ═══════════════════════════════════════
 async function renderActiveRentals() {
   const q = (document.getElementById("searchActive")?.value || "").toLowerCase();
-  const estados = (document.getElementById("filtroEstadoAlq")?.value || "activo,parcial").split(",");
+  const mes = document.getElementById("filtroMesAlq")?.value || "";
+  const estado = document.getElementById("filtroEstadoAlq")?.value || "";
+  const tipoFiscal = document.getElementById("filtroFiscalAlq")?.value || "";
   const container = document.getElementById("activeRentals");
 
-  // Fetch for each selected state
-  const allAlq = [];
-  for (const est of estados) {
-    const rows = await api(`/alquileres?estado=${est.trim()}`).then(r => r.json());
-    allAlq.push(...rows);
-  }
-
-  const today = new Date();
-  const lista = allAlq.filter(a => !q || a.cliente_nombre.toLowerCase().includes(q) || String(a.id).includes(q));
+  const qs = new URLSearchParams();
+  if (mes) qs.set("anio_mes", mes);
+  if (estado) qs.set("estado", estado);
+  if (tipoFiscal) qs.set("tipo_documento", tipoFiscal);
+  if (q) qs.set("buscar", q);
+  const lista = await api("/periodos?" + qs.toString()).then(r => r.json());
 
   if (!lista.length) {
     container.innerHTML = `<div style="text-align:center;color:var(--muted);padding:40px">
-      <div style="font-size:2rem;margin-bottom:10px">Sin alquileres activos</div></div>`;
+      <div style="font-size:2rem;margin-bottom:10px">Sin cuentas en este filtro</div></div>`;
     return;
   }
 
-  const withItems = await Promise.all(lista.map(async a => {
-    const items = await api(`/alquileres/${a.id}/items`).then(r => r.json());
-    return { ...a, items };
-  }));
-
-  container.innerHTML = withItems.map(a => {
-    const isOverdue = a.fecha_devolucion_esperada && new Date(a.fecha_devolucion_esperada) < today;
-    const isParcial = a.estado === "parcial";
-    const cardClass = isOverdue ? "overdue" : isParcial ? "parcial" : "ok";
-    const fechaSal = (a.fecha_salida || "").substr(0, 16).replace("T", " ");
-    const fechaEsp = a.fecha_devolucion_esperada ? a.fecha_devolucion_esperada.substr(0, 10) : "Sin fecha";
-
-    const itemsSummary = a.items.map(i => {
-      const devuelto = i.cantidad_devuelta || 0;
-      const pendiente = i.cantidad - devuelto;
-      const progressPct = Math.round((devuelto / i.cantidad) * 100);
-      const color = devuelto >= i.cantidad ? "#10b981" : devuelto > 0 ? "#f59e0b" : "#e5e7eb";
-      return `<div style="display:inline-flex;align-items:center;gap:4px;margin:2px 4px 2px 0">
-        <span class="badge badge-gray">${pendiente > 0 ? pendiente + "x" : "OK"} [${i.referencia}] ${i.nombre}</span>
-        ${devuelto > 0 ? `<div class="progress-bar" style="width:40px"><div class="progress-bar-fill" style="width:${progressPct}%;background:${color}"></div></div>` : ""}
-      </div>`;
-    }).join("");
-
+  container.innerHTML = lista.map(a => {
+    const tipo = a.tipo_documento || "";
+    const cardClass = a.estado === "activo" ? "ok" : "parcial";
+    const tipoBadge = tipo === "fiscal"
+      ? '<span class="badge badge-green" style="margin-left:8px">Fiscal</span>'
+      : tipo === "no_fiscal"
+      ? '<span class="badge badge-purple" style="margin-left:8px">No fiscal</span>'
+      : '<span class="badge badge-gray" style="margin-left:8px">Seguimiento</span>';
     return `<div class="rental-card ${cardClass}">
       <div>
         <div style="font-weight:700;font-size:1rem">
-          <span class="badge badge-blue">#${String(a.id).padStart(4, "0")}</span>
-          ${a.cliente_nombre}
-          ${isOverdue ? '<span class="badge badge-red" style="margin-left:8px">VENCIDO</span>' : ""}
-          ${isParcial ? '<span class="badge badge-orange" style="margin-left:8px">PARCIAL</span>' : ""}
+          <span class="badge badge-blue">${a.anio_mes || ""}</span>
+          ${escHtml(a.cliente_nombre)}
+          ${tipoBadge}
+          ${a.estado === "activo" ? '<span class="badge badge-green" style="margin-left:8px">En obra</span>' : '<span class="badge badge-gray" style="margin-left:8px">Cerrado</span>'}
         </div>
         <div class="rental-meta">
-          Salida: ${fechaSal} | Dev. esperada: ${fechaEsp} | ${a.operario}
+          ${a.obra ? "Obra: " + escHtml(a.obra) + " | " : ""}
+          ${a.remitos_n || 0} remitos |
+          ${a.saldos_n || 0} materiales en saldo |
+          cobro ${fmtMoney(a.total_cobrado)} |
+          transporte ${fmtMoney(a.transporte)}
         </div>
-        <div class="rental-items-list" style="margin-top:8px">${itemsSummary}</div>
-        ${a.notas ? `<div style="margin-top:6px;font-size:.8rem;color:var(--muted)">${a.notas}</div>` : ""}
       </div>
       <div class="rental-actions">
-        <button class="btn btn-warn btn-sm" onclick="abrirDevolucion(${a.id})">Devolver</button>
-        <a class="btn btn-ghost btn-sm" href="/alquileres/${a.id}/pdf" target="_blank">PDF</a>
+        <button class="btn btn-primary btn-sm" onclick="abrirFicha(${a.id})">Ficha</button>
       </div>
     </div>`;
   }).join("");
+}
+
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function abrirFicha(id) {
+  const p = await api("/periodos/" + id).then(r => r.json());
+  if (!p || p.error) return toast("No se pudo cargar la ficha", "error");
+  fichaActual = p;
+  document.getElementById("fichaTitulo").textContent = (p.cliente_nombre || "Cliente") + " · " + (p.anio_mes || "");
+  document.getElementById("fichaMeta").textContent =
+    [p.tipo_documento, p.obra, p.cliente_tel].filter(Boolean).join(" · ");
+  const remHtml = (p.remitos || []).length
+    ? (p.remitos || []).map(r => {
+        const items = (r.items || []).map(i => `${escHtml(i.material)} (${i.cantidad})`).join(", ");
+        return `<tr>
+          <td>${escHtml(r.numero)}</td>
+          <td>${escHtml(r.fecha || "-")}</td>
+          <td>${escHtml(r.hora || "-")}</td>
+          <td>${fmtMoney(r.transporte)}</td>
+          <td>${escHtml(r.placa || "-")}</td>
+          <td style="font-size:.8rem">${items || "-"}</td>
+        </tr>`;
+      }).join("")
+    : '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Sin remitos</td></tr>';
+  const salHtml = (p.saldos || []).length
+    ? (p.saldos || []).map(s => `<tr><td>${escHtml(s.material)}</td><td>${s.cantidad}</td></tr>`).join("")
+    : '<tr><td colspan="2" style="text-align:center;color:var(--muted)">Sin saldo en obra</td></tr>';
+  const cobHtml = (p.cobros || []).length
+    ? (p.cobros || []).map(c => `<tr>
+        <td>${escHtml(c.material)}</td>
+        <td>${c.dias || ""}</td>
+        <td>${c.cantidad || ""}</td>
+        <td>${fmtMoney(c.valor_unitario)}</td>
+        <td><b>${fmtMoney(c.total)}</b></td>
+      </tr>`).join("")
+    : '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Sin cobro en este documento</td></tr>';
+  const pagHtml = (p.pagos || []).length
+    ? (p.pagos || []).map(x => `<tr>
+        <td>${escHtml(x.fecha || "-")}</td>
+        <td>${escHtml(x.detalle || "")}</td>
+        <td>${fmtMoney(x.monto)}</td>
+      </tr>`).join("")
+    : "";
+  const tipoViaje = t => t === "recogida" ? "Recogida" : t === "ida_vuelta" ? "Ida y vuelta" : "Llevada";
+  const quienViaje = q => q === "cliente" ? "Cliente" : "Equioriente";
+  const viajes = p.viajes || [];
+  const vjHtml = viajes.length
+    ? viajes.map(v => `<tr>
+        <td>${escHtml(v.fecha || "-")}</td>
+        <td>${tipoViaje(v.tipo)}</td>
+        <td>${quienViaje(v.quien)}</td>
+        <td>${escHtml(v.placa || "-")}</td>
+        <td>${escHtml(v.direccion || p.obra || "-")}</td>
+        <td><b>${fmtMoney(v.precio)}</b></td>
+      </tr>`).join("")
+    : '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Sin viajes de camión</td></tr>';
+  const ingresoCamion = viajes.filter(v => v.quien === "equioriente").reduce((s, v) => s + (Number(v.precio) || 0), 0);
+  document.getElementById("fichaBody").innerHTML = `
+    <div class="stat-grid" style="margin-bottom:16px">
+      <div class="stat-card"><div class="stat-value">${fmtMoney(p.total_cobrado)}</div><div class="stat-label">Cobro material</div></div>
+      <div class="stat-card"><div class="stat-value">${fmtMoney(ingresoCamion)}</div><div class="stat-label">Transporte</div></div>
+      <div class="stat-card"><div class="stat-value">${(p.remitos || []).length}</div><div class="stat-label">Remitos</div></div>
+      <div class="stat-card"><div class="stat-value">${(p.saldos || []).length}</div><div class="stat-label">Saldos</div></div>
+    </div>
+    <div class="card-title">Viajes de camión</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Fecha</th><th>Tipo</th><th>Quién</th><th>Placa</th><th>Dirección</th><th>Precio</th></tr></thead>
+      <tbody>${vjHtml}</tbody>
+    </table></div>
+    <div class="form-grid cols-3" style="margin:12px 0 8px;align-items:end">
+      <div><label>Precio recogida ($)</label><input type="number" id="ficha_rec_precio" min="0" placeholder="0"></div>
+      <div><label>Placa</label><input id="ficha_rec_placa" placeholder="CWG-768"></div>
+      <div><button class="btn btn-primary btn-sm" onclick="agregarRecogidaFicha(${p.alquiler_id || "null"}, ${p.id})">Registrar recogida</button></div>
+    </div>
+    ${p.alquiler_id ? `<div style="margin-bottom:12px"><button class="btn btn-warn btn-sm" onclick="closeFicha(); abrirDevolucion(${p.alquiler_id})">Devolver material</button></div>` : ""}
+    <div class="card-title">Remitos</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>N°</th><th>Fecha</th><th>Hora</th><th>Transporte</th><th>Placa</th><th>Material</th></tr></thead>
+      <tbody>${remHtml}</tbody>
+    </table></div>
+    <div class="card-title" style="margin-top:18px">Saldo en obra</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Material</th><th>Cantidad</th></tr></thead>
+      <tbody>${salHtml}</tbody>
+    </table></div>
+    <div class="card-title" style="margin-top:18px">Cobro</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Material</th><th>Días</th><th>Cant.</th><th>$/und</th><th>Total</th></tr></thead>
+      <tbody>${cobHtml}</tbody>
+    </table></div>
+    ${pagHtml ? `<div class="card-title" style="margin-top:18px">Abonos</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Fecha</th><th>Detalle</th><th>Monto</th></tr></thead>
+      <tbody>${pagHtml}</tbody>
+    </table></div>` : ""}
+  `;
+  document.getElementById("modalFicha").classList.remove("hidden");
+}
+function closeFicha() {
+  document.getElementById("modalFicha").classList.add("hidden");
+  fichaActual = null;
+}
+
+async function agregarRecogidaFicha(alquilerId, periodoId) {
+  if (!alquilerId && !periodoId) return toast("No hay alquiler asociado", "error");
+  const precio = parseFloat(document.getElementById("ficha_rec_precio").value) || 0;
+  const placa = (document.getElementById("ficha_rec_placa").value || "").trim() || null;
+  const res = await api("/viajes", {
+    method: "POST",
+    body: JSON.stringify({
+      alquiler_id: alquilerId || null,
+      periodo_id: periodoId || null,
+      tipo: "recogida",
+      quien: "equioriente",
+      precio,
+      placa,
+      direccion: (fichaActual && (fichaActual.obra || fichaActual.cliente_direccion)) || null
+    })
+  });
+  if (!res.ok) return toast(await res.text(), "error");
+  toast("Recogida registrada");
+  if (periodoId) abrirFicha(periodoId);
 }
 
 // ═══════════════════════════════════════
@@ -1526,6 +2022,10 @@ async function abrirDevolucion(alqId) {
     </div>`;
   }).join("");
 
+  document.getElementById("md_recoge").checked = false;
+  document.getElementById("mdRecogidaFields").classList.add("hidden");
+  document.getElementById("md_rec_precio").value = "";
+  document.getElementById("md_rec_placa").value = "";
   document.getElementById("modalDevolucion").classList.remove("hidden");
 }
 
@@ -1549,6 +2049,14 @@ async function confirmarDevolucionParcial(parcial = false) {
     });
     if (!items_devueltos.length) return toast("Selecciona al menos un articulo para devolver", "error");
     body = { items_devueltos };
+  }
+  if (document.getElementById("md_recoge").checked) {
+    body.recogida = {
+      activa: true,
+      quien: "equioriente",
+      precio: parseFloat(document.getElementById("md_rec_precio").value) || 0,
+      placa: (document.getElementById("md_rec_placa").value || "").trim() || null
+    };
   }
 
   const res = await api(`/alquileres/${devolucionAlqId}/devolver`, {
@@ -1869,12 +2377,47 @@ async function exportarCliente(id, nombre) {
 //  REPORTES
 // ═══════════════════════════════════════
 async function loadReporte(tipo) {
+  window._repTipo = tipo;
   const statsDiv = document.getElementById("reporteStats");
   const contentDiv = document.getElementById("reporteContent");
   const filtroFecha = document.getElementById("filtrosFechaReporte");
 
-  filtroFecha.classList.toggle("hidden", tipo !== "ingresos");
+  filtroFecha.classList.toggle("hidden", tipo !== "ingresos" && tipo !== "transporte");
   statsDiv.classList.add("hidden");
+
+  if (tipo === "transporte") {
+    const desde = document.getElementById("rep_desde").value;
+    const hasta = document.getElementById("rep_hasta").value;
+    let url = "/reportes/transporte?";
+    if (desde) url += `desde=${desde}&`;
+    if (hasta) url += `hasta=${hasta}`;
+    const data = await api(url).then(r => r.json());
+    const t = data.totales || {};
+    statsDiv.innerHTML = `
+      <div class="stat-card"><div class="stat-value">${fmtMoney(t.ingreso_camion)}</div><div class="stat-label">Ingreso camión</div></div>
+      <div class="stat-card"><div class="stat-value">${t.viajes_camion || 0}</div><div class="stat-label">Viajes Equioriente</div></div>
+      <div class="stat-card"><div class="stat-value">${t.llevadas || 0}</div><div class="stat-label">Llevadas</div></div>
+      <div class="stat-card"><div class="stat-value">${t.recogidas || 0}</div><div class="stat-label">Recogidas</div></div>
+      <div class="stat-card"><div class="stat-value">${t.cliente_sin_camion || 0}</div><div class="stat-label">Las llevó el cliente</div></div>
+    `;
+    statsDiv.classList.remove("hidden");
+    const tipoV = x => x === "recogida" ? "Recogida" : x === "ida_vuelta" ? "Ida y vuelta" : "Llevada";
+    contentDiv.innerHTML = `<p style="color:var(--muted);font-size:.85rem;margin:0 0 12px">Un remito = un viaje. No se cuenta otra vez el mismo viaje en seguimiento y en factura.</p>
+      <div class="table-wrap"><table>
+      <thead><tr><th>Fecha</th><th>Remito</th><th>Cliente</th><th>Dirección</th><th>Tipo</th><th>Quién</th><th>Placa</th><th>Precio</th></tr></thead>
+      <tbody>${(data.detalle || []).map(r => `<tr>
+        <td>${r.fecha || "-"}</td>
+        <td>${r.remito_numero || "-"}</td>
+        <td><b>${r.cliente_nombre || "-"}</b></td>
+        <td>${r.obra || "-"}</td>
+        <td>${tipoV(r.tipo)}</td>
+        <td>${r.quien === "cliente" ? "Cliente" : "Equioriente"}</td>
+        <td>${r.placa || "-"}</td>
+        <td><b>${r.quien === "cliente" ? "—" : fmtMoney(r.precio)}</b></td>
+      </tr>`).join("") || '<tr><td colspan="8" style="text-align:center;color:var(--muted)">Sin viajes</td></tr>'}</tbody>
+    </table></div>`;
+    return;
+  }
 
   if (tipo === "ingresos") {
     const desde = document.getElementById("rep_desde").value;
@@ -1962,11 +2505,12 @@ async function renderHistorial() {
   const q = (document.getElementById("searchHist")?.value || "").toLowerCase();
   const tbody = document.getElementById("tablaHistorial");
 
-  const alqRows = await Promise.all(historialData.map(async a => {
-    const items = await api(`/alquileres/${a.id}/items`).then(r => r.json());
-    const hasExternal = items.some(i => i.es_externo);
-    const total = items.reduce((s, i) => s + (i.total_calculado || (i.precio_dia_aplicado * (i.dias_reales || i.dias_acordados) * i.cantidad)), 0);
-    return { ...a, total, items, hasExternal, _type: "alquiler" };
+  const alqRows = historialData.map(a => ({
+    ...a,
+    total: Number(a.total_cobrado) || 0,
+    items: [],
+    hasExternal: false,
+    _type: "alquiler"
   }));
 
   const lista = alqRows.filter(row => !q || (row.cliente_nombre || "").toLowerCase().includes(q));
@@ -1996,7 +2540,9 @@ async function renderHistorial() {
       <td>${row.operario}</td>
       <td>${estadoBadge}</td>
       <td><b>$${row.total.toLocaleString()}</b></td>
-      <td><a class="btn btn-ghost btn-sm" href="/alquileres/${row.id}/pdf" target="_blank">PDF</a></td>
+      <td><a class="btn btn-ghost btn-sm" href="/alquileres/${row.id}/pdf" target="_blank">PDF</a>
+        ${row.estado !== "devuelto" ? `<button class="btn btn-warn btn-sm" onclick="abrirDevolucion(${row.id})">Devolver</button>` : ""}
+      </td>
     </tr>`;
   }).join("");
 }
@@ -2021,6 +2567,156 @@ async function loadMovimientos() {
       <td>${r.operario || '-'}</td>
     </tr>`;
   }).join("");
+}
+
+// ═══════════════════════════════════════
+//  CAJA / DOCUMENTOS
+// ═══════════════════════════════════════
+function fmtMoney(n) {
+  return "$" + Number(n || 0).toLocaleString("es-CO", { maximumFractionDigits: 0 });
+}
+
+async function loadCaja() {
+  const fechaEl = document.getElementById("caja_fecha");
+  if (fechaEl && !fechaEl.value) {
+    const d = new Date();
+    fechaEl.value = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+  const anio = document.getElementById("flujoAnio")?.value || "";
+  const mes = document.getElementById("flujoMes")?.value || "";
+  const tipo = document.getElementById("flujoTipo")?.value || "";
+  const buscar = document.getElementById("flujoBuscar")?.value || "";
+  const qs = new URLSearchParams();
+  if (anio) qs.set("anio", anio);
+  if (mes) qs.set("mes", mes);
+  if (tipo) qs.set("tipo", tipo);
+  if (buscar) qs.set("buscar", buscar);
+  const data = await api("/flujo?" + qs.toString()).then(r => r.json());
+  const t = data.totales || {};
+  document.getElementById("cajaStats").innerHTML = `
+    <div class="stat-card"><div class="stat-value">${fmtMoney(t.ingreso)}</div><div class="stat-label">Ingresos</div></div>
+    <div class="stat-card"><div class="stat-value">${fmtMoney(t.egreso)}</div><div class="stat-label">Egresos</div></div>
+    <div class="stat-card"><div class="stat-value">${fmtMoney(t.traslado)}</div><div class="stat-label">Traslados</div></div>
+    <div class="stat-card"><div class="stat-value">${fmtMoney((t.ingreso || 0) - (t.egreso || 0))}</div><div class="stat-label">Neto</div></div>
+  `;
+  const tbody = document.getElementById("tablaFlujo");
+  const rows = (data.detalle || []).slice(0, 400);
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Sin movimientos</td></tr>';
+  } else {
+    tbody.innerHTML = rows.map(r => {
+      const badge = r.tipo === "ingreso" ? "badge-green" : r.tipo === "egreso" ? "badge-red" : "badge-orange";
+      const borrar = !r.fuente || r.fuente === "manual"
+        ? `<button class="btn btn-ghost btn-sm" onclick="borrarFlujo(${r.id})">Borrar</button>`
+        : "";
+      return `<tr>
+        <td>${(r.fecha || "").slice(0, 10) || "-"}</td>
+        <td>${escHtml(r.detalle || "")}</td>
+        <td><span class="badge ${badge}">${escHtml(r.tipo)}</span></td>
+        <td>${escHtml(r.medio || "-")}</td>
+        <td><b>${fmtMoney(r.valor)}</b></td>
+        <td>${borrar}</td>
+      </tr>`;
+    }).join("");
+  }
+  const pagos = await api("/pagos").then(r => r.json());
+  const pt = document.getElementById("tablaPagos");
+  if (!pagos.length) {
+    pt.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Sin pagos registrados en seguimiento</td></tr>';
+  } else {
+    pt.innerHTML = pagos.map(p => `<tr>
+      <td>${(p.fecha || "").slice(0, 10) || "-"}</td>
+      <td><b>${p.cliente_nombre || "-"}</b></td>
+      <td>${p.tipo || "pago"}</td>
+      <td>${p.detalle || ""}</td>
+      <td>${p.medio || "-"}</td>
+      <td><b>${fmtMoney(p.monto)}</b></td>
+    </tr>`).join("");
+  }
+}
+
+async function guardarFlujo() {
+  const fecha = document.getElementById("caja_fecha").value;
+  const detalle = document.getElementById("caja_detalle").value.trim();
+  const valor = document.getElementById("caja_valor").value;
+  const tipo = document.getElementById("caja_tipo").value;
+  const medio = document.getElementById("caja_medio").value.trim();
+  if (!detalle) return toast("Escribe el detalle", "error");
+  if (!valor || Number(valor) === 0) return toast("Escribe el valor", "error");
+  const res = await api("/flujo", {
+    method: "POST",
+    body: JSON.stringify({ fecha, detalle, valor, tipo, medio })
+  });
+  if (!res.ok) return toast(await res.text(), "error");
+  document.getElementById("caja_detalle").value = "";
+  document.getElementById("caja_valor").value = "";
+  if (fecha) {
+    document.getElementById("flujoAnio").value = fecha.slice(0, 4);
+    document.getElementById("flujoMes").value = String(parseInt(fecha.slice(5, 7), 10));
+    document.getElementById("flujoTipo").value = "";
+  }
+  toast("Movimiento añadido");
+  await loadCaja();
+}
+
+function borrarFlujo(id) {
+  showConfirm("¿Borrar este movimiento de caja?", async () => {
+    const res = await api("/flujo/" + id, { method: "DELETE" });
+    if (!res.ok) return toast(await res.text(), "error");
+    toast("Movimiento borrado");
+    await loadCaja();
+  });
+}
+
+async function loadDocumentos() {
+  const dominio = document.getElementById("docDominio")?.value || "";
+  const tipo = document.getElementById("docTipo")?.value || "";
+  const q = document.getElementById("docBuscar")?.value || "";
+  const qs = new URLSearchParams();
+  if (tipo) qs.set("tipo", tipo);
+  if (dominio) qs.set("dominio", dominio);
+  if (q) qs.set("q", q);
+  const rows = await api("/documentos?" + qs.toString()).then(r => r.json());
+  const tbody = document.getElementById("tablaDocumentos");
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Sin documentos</td></tr>';
+  } else {
+    tbody.innerHTML = rows.map(d => `<tr>
+      <td><span class="badge badge-gray">${d.dominio || "-"}</span></td>
+      <td><span class="badge badge-blue">${d.tipo}</span></td>
+      <td><b>${d.titulo || d.archivo}</b></td>
+      <td>${d.anio || "-"}</td>
+      <td>${d.archivo}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="descargarArchivo('${encodeURIComponent(d.ruta)}','${(d.archivo || "archivo").replace(/'/g, "")}')">Abrir</button></td>
+    </tr>`).join("");
+  }
+  const cots = await api("/cotizaciones").then(r => r.json());
+  const ct = document.getElementById("tablaCotizaciones");
+  if (!cots.length) {
+    ct.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px">Sin cotizaciones</td></tr>';
+  } else {
+    ct.innerHTML = cots.map(c => `<tr>
+      <td><b>${c.cliente_nombre || "-"}</b></td>
+      <td>${c.fuente_hoja || "-"}</td>
+      <td>${fmtMoney(c.transporte)}</td>
+      <td><b>${fmtMoney(c.total)}</b></td>
+      <td><span class="badge badge-gray">${c.estado || ""}</span></td>
+    </tr>`).join("");
+  }
+}
+
+async function descargarArchivo(rutaEnc, nombre) {
+  const ruta = decodeURIComponent(rutaEnc);
+  const res = await api("/archivos/" + ruta.split("/").map(encodeURIComponent).join("/"));
+  if (!res.ok) return toast("No se pudo abrir el archivo", "error");
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = nombre || "archivo";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
 }
 
 // ═══════════════════════════════════════

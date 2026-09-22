@@ -1,0 +1,6 @@
+.env
+data/store.json
+node_modules/
+backups/
+*.log
+~$

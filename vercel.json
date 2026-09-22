@@ -5,7 +5,7 @@
       "src": "server.js",
       "use": "@vercel/node",
       "config": {
-        "includeFiles": ["index.html"]
+        "includeFiles": ["index.html", "data/store.json", "lib/localDb.js", "Equioriente_Data/**"]
       }
     }
   ],
