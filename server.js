@@ -30,6 +30,7 @@ loadEnv();
 // ── Config ────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const EQUIORIENTE_APP_KEY = process.env.EQUIORIENTE_APP_KEY || "";
 const JWT_SECRET   = process.env.JWT_SECRET || "equioriente_secret_change_me";
 const SALT_ROUNDS  = 10;
 const PORT = parseInt(process.env.PORT) || 3000;
@@ -41,7 +42,12 @@ const supabaseConfigured = !!(SUPABASE_URL && SUPABASE_KEY
     && !/tu-proyecto|tu_service/i.test(String(SUPABASE_URL) + String(SUPABASE_KEY)));
 
 const sb = supabaseConfigured
-    ? createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } })
+    ? createClient(SUPABASE_URL, SUPABASE_KEY, {
+        auth: { persistSession: false },
+        global: EQUIORIENTE_APP_KEY
+            ? { headers: { "x-equioriente-key": EQUIORIENTE_APP_KEY } }
+            : undefined
+    })
     : createLocalDb(STORE_PATH);
 
 if (!supabaseConfigured) {
@@ -106,8 +112,8 @@ const sqRpc = async (fn, params = {}) => {
 };
 
 // Ajuste de stock usando RPC (evita race conditions en aritmética)
-const ajustarStock = (id, { total = 0, disponible = 0, danado = 0 } = {}) =>
-    sqRpc("equioriente_ajustar_stock", { p_id: id, p_total: total, p_disp: disponible, p_dano: danado });
+const ajustarStock = (id, { total = 0, disponible = 0, danado = 0, alquilado = 0 } = {}) =>
+    sqRpc("equioriente_ajustar_stock", { p_id: id, p_total: total, p_disp: disponible, p_dano: danado, p_alq: alquilado });
 
 // Log de movimiento de inventario
 const logMov = (articulo_id, tipo, cantidad, motivo, referencia_id, usuario_id) =>
@@ -116,6 +122,60 @@ const logMov = (articulo_id, tipo, cantidad, motivo, referencia_id, usuario_id) 
 
 function hoyYmd() {
     return new Date().toISOString().slice(0, 10);
+}
+
+async function fetchInChunks(table, column, ids, select) {
+    const out = [];
+    for (let i = 0; i < ids.length; i += 80) {
+        const chunk = ids.slice(i, i + 80);
+        out.push(...await sq(sb.from(table).select(select).in(column, chunk)));
+    }
+    return out;
+}
+
+/** En obra = saldo que dejaron los remitos en el último mes de cada cuenta. Total no se toca. */
+async function enObraPorArticulo() {
+    const map = new Map();
+    const add = (id, q) => {
+        const n = Number(q);
+        if (id == null || !n) return;
+        const k = Number(id);
+        map.set(k, (map.get(k) || 0) + n);
+    };
+    const periodos = await sq(sb.from(T.pe).select("id,cuenta_id,anio_mes,estado,alquiler_id"));
+    const latest = new Map();
+    for (const p of periodos) {
+        const prev = latest.get(p.cuenta_id);
+        if (!prev || String(p.anio_mes) > String(prev.anio_mes)) latest.set(p.cuenta_id, p);
+    }
+    const activos = [...latest.values()].filter(p => p.estado === "activo");
+    const perIds = activos.map(p => p.id);
+    if (perIds.length) {
+        const saldos = await fetchInChunks(T.sp, "periodo_id", perIds, "articulo_id,cantidad");
+        for (const s of saldos) add(s.articulo_id, s.cantidad);
+    }
+    const covered = new Set(periodos.map(p => p.alquiler_id).filter(Boolean));
+    const alqs = await sq(sb.from(T.al).select("id").in("estado", ["activo", "parcial"]));
+    const extra = alqs.map(a => a.id).filter(id => !covered.has(id));
+    if (extra.length) {
+        const items = await fetchInChunks(T.it, "alquiler_id", extra, "articulo_id,cantidad,cantidad_devuelta");
+        for (const it of items) add(it.articulo_id, (Number(it.cantidad) || 0) - (Number(it.cantidad_devuelta) || 0));
+    }
+    return map;
+}
+
+function conPosicionRemitos(rows, enObra) {
+    return rows.map(a => {
+        const total = Number(a.stock_total) || 0;
+        const danado = Number(a.stock_danado) || 0;
+        const cap = Math.max(0, total - danado);
+        const obra = Math.min(cap, Math.max(0, enObra.get(Number(a.id)) || 0));
+        return {
+            ...a,
+            stock_alquilado: obra,
+            stock_disponible: cap - obra
+        };
+    });
 }
 
 async function insertViaje(data) {
@@ -281,13 +341,17 @@ app.get("/articulos", authMiddleware, async (req, res) => {
         if (buscar) q = q.or(`nombre.ilike.%${buscar}%,referencia.ilike.%${buscar}%`);
         if (categoria_id) q = q.eq("categoria_id", categoria_id);
         const rows = await sq(q);
-        res.json(rows.map(a => ({ ...a, categoria_nombre: a.categoria?.nombre ?? null, categoria: undefined })));
+        const mapped = rows.map(a => ({ ...a, categoria_nombre: a.categoria?.nombre ?? null, categoria: undefined }));
+        res.json(conPosicionRemitos(mapped, await enObraPorArticulo()));
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/articulos/alertas", authMiddleware, async (req, res) => {
-    try { res.json(await sqRpc("equioriente_articulos_alertas")); }
-    catch (e) { res.status(500).json({ error: e.message }); }
+    try {
+        const enObra = await enObraPorArticulo();
+        const arts = conPosicionRemitos(await sq(sb.from(T.ar).select("*")), enObra);
+        res.json(arts.filter(a => (a.stock_minimo || 0) > 0 && a.stock_disponible <= a.stock_minimo));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/articulos", authMiddleware, async (req, res) => {
@@ -377,7 +441,7 @@ app.post("/alquileres", authMiddleware, async (req, res) => {
                 cantidad: item.cantidad, precio_dia_aplicado: item.precio_dia_aplicado,
                 dias_acordados: item.dias_acordados
             });
-            await ajustarStock(item.articulo_id, { disponible: -item.cantidad });
+            await ajustarStock(item.articulo_id, { disponible: -item.cantidad, alquilado: item.cantidad });
             await logMov(item.articulo_id, "salida", item.cantidad, "Alquiler #" + alqId, alqId, req.user.id);
         }
         if (Array.isArray(viajes)) {
@@ -439,6 +503,10 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
         const ahora = new Date();
         const diasReales = Math.max(1, Math.ceil((ahora - new Date(alq.fecha_salida)) / 86400000));
         const allItems = await sq(sb.from(T.it).select("*").eq("alquiler_id", alqId));
+        const hayPendiente = allItems.some(i => (i.cantidad - (i.cantidad_devuelta || 0)) > 0);
+        if (!allItems.length || !hayPendiente) {
+            return res.status(400).send("No hay material pendiente. Ya fue devuelto.");
+        }
 
         if (items_devueltos?.length) {
             for (const dev of items_devueltos) {
@@ -451,7 +519,7 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
                     cantidad_devuelta: newDev, dias_reales: diasReales,
                     total_calculado: item.precio_dia_aplicado * diasReales * newDev
                 }, item.id);
-                await ajustarStock(item.articulo_id, { disponible: cantDev });
+                await ajustarStock(item.articulo_id, { disponible: cantDev, alquilado: -cantDev });
                 await logMov(item.articulo_id, "entrada", cantDev, "Devolucion parcial alquiler #" + alqId, alqId, req.user.id);
             }
         } else {
@@ -462,7 +530,7 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
                     cantidad_devuelta: item.cantidad, dias_reales: diasReales,
                     total_calculado: item.precio_dia_aplicado * diasReales * item.cantidad
                 }, item.id);
-                await ajustarStock(item.articulo_id, { disponible: pendiente });
+                await ajustarStock(item.articulo_id, { disponible: pendiente, alquilado: -pendiente });
                 await logMov(item.articulo_id, "entrada", pendiente, "Devolucion alquiler #" + alqId, alqId, req.user.id);
             }
         }
@@ -593,10 +661,7 @@ app.get("/reportes/articulos-top", authMiddleware, async (req, res) => {
 
 app.get("/reportes/ingresos", authMiddleware, async (req, res) => {
     try {
-        const data = await sqRpc("equioriente_reporte_ingresos", {
-            p_desde: req.query.desde || null, p_hasta: req.query.hasta || null
-        });
-        res.json({ detalle: data?.detalle ?? [], totales: data?.totales ?? {} });
+        res.json(await buildIngresos(req.query.desde || "", req.query.hasta || ""));
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -616,7 +681,7 @@ app.get("/reportes/morosos", authMiddleware, async (req, res) => {
 });
 
 app.get("/reportes/estadisticas", authMiddleware, async (req, res) => {
-    try { res.json(await sqRpc("equioriente_estadisticas")); }
+    try { res.json(await buildEstadisticas()); }
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -723,6 +788,120 @@ function byId(rows) {
     const m = new Map();
     for (const r of rows) m.set(String(r.id), r);
     return m;
+}
+
+function ymHoy() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+function ymPasado() {
+    const d = new Date();
+    const p = new Date(d.getFullYear(), d.getMonth() - 1, 1);
+    return `${p.getFullYear()}-${String(p.getMonth() + 1).padStart(2, "0")}`;
+}
+
+async function buildEstadisticas() {
+    const thisMonth = ymHoy();
+    const prevMonth = ymPasado();
+    const [periodos, cuentas, clientes, cobros, articulos] = await Promise.all([
+        sq(sb.from(T.pe).select("id, cuenta_id, anio_mes, total_cobrado, estado")),
+        sq(sb.from(T.cu).select("id, cliente_id")),
+        sq(sb.from(T.cl).select("id, nombre")),
+        sq(sb.from(T.cb).select("periodo_id, articulo_id, material, cantidad, total")),
+        sq(sb.from(T.ar).select("id, nombre"))
+    ]);
+    const ctaMap = byId(cuentas);
+    const cliMap = byId(clientes);
+    const artMap = byId(articulos);
+    const byMes = {};
+    for (const p of periodos) {
+        const m = p.anio_mes || "";
+        if (!m) continue;
+        if (!byMes[m]) byMes[m] = { mes: m, alquileres: 0, ingreso: 0 };
+        byMes[m].alquileres += 1;
+        byMes[m].ingreso += Number(p.total_cobrado) || 0;
+    }
+    const meses = Object.keys(byMes).sort().map(k => byMes[k]);
+    const ofMonth = m => periodos.filter(p => p.anio_mes === m);
+    const ingresoMes = m => ofMonth(m).reduce((s, p) => s + (Number(p.total_cobrado) || 0), 0);
+    const alsMes = ofMonth(thisMonth);
+    const cobroByCli = {};
+    for (const p of alsMes) {
+        const cid = ctaMap.get(String(p.cuenta_id))?.cliente_id;
+        if (!cid) continue;
+        cobroByCli[cid] = (cobroByCli[cid] || 0) + (Number(p.total_cobrado) || 0);
+    }
+    const topCid = Object.keys(cobroByCli).sort((a, b) => cobroByCli[b] - cobroByCli[a])[0];
+    const topCliente = topCid ? {
+        nombre: cliMap.get(String(topCid))?.nombre || "",
+        total: cobroByCli[topCid]
+    } : null;
+    const perIdsMes = new Set(alsMes.map(p => p.id));
+    const byArt = {};
+    for (const c of cobros) {
+        if (!perIdsMes.has(c.periodo_id)) continue;
+        const key = c.articulo_id ? String(c.articulo_id) : "m:" + (c.material || "");
+        byArt[key] = (byArt[key] || 0) + (Number(c.cantidad) || 0);
+    }
+    const topAid = Object.keys(byArt).sort((a, b) => byArt[b] - byArt[a])[0];
+    let topArticulo = null;
+    if (topAid) {
+        const nombre = topAid.startsWith("m:")
+            ? topAid.slice(2)
+            : (artMap.get(topAid)?.nombre || "");
+        topArticulo = { nombre, total: byArt[topAid], total_cant: byArt[topAid] };
+    }
+    return {
+        totalArticulos: articulos.length,
+        totalClientes: clientes.length,
+        alquileresActivos: periodos.filter(p => p.estado === "activo").length,
+        mesActual: { alquileres: alsMes.length, ingreso: ingresoMes(thisMonth), ingresos: ingresoMes(thisMonth) },
+        mesPasado: { alquileres: ofMonth(prevMonth).length, ingreso: ingresoMes(prevMonth), ingresos: ingresoMes(prevMonth) },
+        meses,
+        topCliente,
+        topArticulo
+    };
+}
+
+async function buildIngresos(desde, hasta) {
+    const flujo = await sq(sb.from(T.fl).select("id, fecha, detalle, valor, tipo, medio"));
+    const inRange = (fecha) => {
+        const f = String(fecha || "").slice(0, 10);
+        if (!f) return false;
+        if (desde && f < desde) return false;
+        if (hasta && f > hasta) return false;
+        return true;
+    };
+    const rows = flujo.filter(r => r.tipo === "ingreso" && inRange(r.fecha));
+    const total = rows.reduce((s, r) => s + (Number(r.valor) || 0), 0);
+    const periodos = await sq(sb.from(T.pe).select("id, anio_mes, total_cobrado"));
+    const cobrado = periodos
+        .filter(p => {
+            const m = p.anio_mes || "";
+            if (!m) return false;
+            const ini = m + "-01";
+            const fin = m + "-31";
+            if (desde && fin < desde) return false;
+            if (hasta && ini > hasta) return false;
+            return true;
+        })
+        .reduce((s, p) => s + (Number(p.total_cobrado) || 0), 0);
+    return {
+        detalle: rows.map(r => ({
+            fecha: r.fecha,
+            detalle: r.detalle,
+            medio: r.medio,
+            total: Number(r.valor) || 0,
+            ingreso_total: Number(r.valor) || 0,
+            total_alquileres: 1
+        })),
+        totales: {
+            ingreso_total: total,
+            total_ingresos: total,
+            cobrado_alquiler: cobrado,
+            total_alquileres: rows.length
+        }
+    };
 }
 
 app.get("/periodos", authMiddleware, async (req, res) => {
@@ -1120,20 +1299,106 @@ app.get("/alquileres/:id/pdf", authMiddleware, async (req, res) => {
         if (!alq) return res.status(404).send("No encontrado");
 
         const itemRows = await sq(sb.from(T.it)
-            .select(`*, art:${T.ar}!articulo_id(nombre, referencia, es_externo, empresa_externa)`)
+            .select(`*, art:${T.ar}!articulo_id(nombre, referencia, es_externo, empresa_externa, precio_dia)`)
             .eq("alquiler_id", alqId));
+        const periodo = alq.periodo_id
+            ? await sqOne(sb.from(T.pe).select("*").eq("id", alq.periodo_id))
+            : null;
+        const cobros = periodo
+            ? await sq(sb.from(T.cb).select("*").eq("periodo_id", periodo.id).order("id"))
+            : [];
+        const remitos = periodo
+            ? await sq(sb.from(T.re).select("*").eq("periodo_id", periodo.id).order("fecha"))
+            : [];
+        const remIds = remitos.map(r => r.id);
+        const movs = remIds.length
+            ? await sq(sb.from(T.om).select("*").in("remito_id", remIds))
+            : [];
 
-        // Flatten for use in PDF
         alq.cliente_nombre  = alq.cli?.nombre;
         alq.cliente_id_doc  = alq.cli?.identificacion;
         alq.cliente_tel     = alq.cli?.telefono;
         alq.cliente_dir     = alq.cli?.direccion;
         alq.operario        = alq.op?.usuario;
-        const items = itemRows.map(i => ({
-            ...i,
-            nombre: i.art?.nombre, referencia: i.art?.referencia,
-            es_externo: i.art?.es_externo, empresa_externa: i.art?.empresa_externa
-        }));
+
+        const normMat = s => String(s || "").toUpperCase().normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "").replace(/[^A-Z0-9]+/g, " ").trim();
+        const ymd = s => String(s || "").slice(0, 10);
+        const fechasMat = {};
+        for (const r of remitos) {
+            for (const m of movs.filter(x => x.remito_id === r.id)) {
+                const k = normMat(m.material);
+                if (!k) continue;
+                if (!fechasMat[k]) fechasMat[k] = { salio: null, entro: null };
+                const cant = Number(m.cantidad) || 0;
+                if (cant > 0 && !fechasMat[k].salio) fechasMat[k].salio = ymd(r.fecha);
+                if (cant < 0) fechasMat[k].entro = ymd(r.fecha);
+            }
+        }
+        const matchFecha = name => {
+            const n = normMat(name);
+            if (!n) return {};
+            if (fechasMat[n]) return fechasMat[n];
+            const keys = Object.keys(fechasMat);
+            const contains = keys.find(k => k.includes(n) || n.includes(k));
+            if (contains) return fechasMat[contains];
+            const tokens = n.split(" ").filter(t => t.length > 2);
+            let best = null, bestN = 0;
+            for (const k of keys) {
+                const ov = tokens.filter(t => k.includes(t)).length;
+                if (ov > bestN && ov >= 2) { bestN = ov; best = k; }
+            }
+            return best ? fechasMat[best] : {};
+        };
+        const rangoTxt = (name) => {
+            const f = matchFecha(name);
+            if (f.salio && f.entro) return `${f.salio.slice(8, 10)}/${f.salio.slice(5, 7)} - ${f.entro.slice(8, 10)}/${f.entro.slice(5, 7)}`;
+            if (f.salio) return "salio " + f.salio;
+            return "";
+        };
+        const lastRecibo = remitos
+            .filter(r => movs.some(m => m.remito_id === r.id && Number(m.cantidad) < 0))
+            .map(r => ymd(r.fecha))
+            .filter(Boolean)
+            .sort()
+            .pop();
+
+        let lines = [];
+        if (cobros.length) {
+            lines = cobros.map(c => ({
+                nombre: c.material || "Material",
+                referencia: "",
+                cantidad: c.cantidad || 0,
+                dias: c.dias || 0,
+                precio: c.valor_unitario || 0,
+                subtotal: Number(c.total) || 0,
+                rango: rangoTxt(c.material)
+            }));
+        } else {
+            lines = itemRows.map(i => {
+                const nombre = i.material_origen || i.art?.nombre || "Material";
+                const precio = Number(i.precio_dia_aplicado) || Number(i.art?.precio_dia) || 0;
+                const f = matchFecha(nombre);
+                let dias = Number(i.dias_reales) || 0;
+                if (!dias && Number(i.dias_acordados) > 1) dias = Number(i.dias_acordados);
+                if ((!dias || dias === 1) && f.salio && f.entro) {
+                    const a = new Date(f.salio), b = new Date(f.entro);
+                    dias = Math.max(1, Math.round((b - a) / 86400000));
+                }
+                const cant = Number(i.cantidad) || 0;
+                const known = Number(i.total_calculado) || (precio > 0 && dias ? precio * dias * cant : 0);
+                const subtotal = known;
+                return {
+                    nombre,
+                    referencia: i.art?.referencia || "",
+                    cantidad: cant,
+                    dias: dias || "",
+                    precio,
+                    subtotal,
+                    rango: rangoTxt(nombre)
+                };
+            });
+        }
 
         res.setHeader("Content-Type", "application/pdf");
         res.setHeader("Content-Disposition", `inline; filename="recibo_${alqId}.pdf"`);
@@ -1152,19 +1417,19 @@ app.get("/alquileres/:id/pdf", authMiddleware, async (req, res) => {
            .text("Gestion de Equipos y Materiales", L, 68, { align: "center", width: PW });
         hline(84, "#1e3a5f", 2);
 
-        const estado = alq.estado;
-        const estadoColor = estado === "devuelto" ? "#059669" : estado === "parcial" ? "#d97706" : "#dc2626";
-        const estadoText  = estado === "devuelto" ? "DEVUELTO" : estado === "parcial" ? "PARCIAL" : "EN CURSO";
-        const fechaSal  = (alq.fecha_salida || "").substring(0, 16).replace("T", " ");
-        const fechaEsp  = alq.fecha_devolucion_esperada || "No especificada";
-        const fechaReal = (alq.fecha_devolucion_real || "").substring(0, 16).replace("T", " ") || "-";
+        const cerrado = (periodo && periodo.estado === "cerrado") || alq.estado === "devuelto";
+        const estadoColor = cerrado ? "#059669" : alq.estado === "parcial" ? "#d97706" : "#1d4ed8";
+        const estadoText  = cerrado ? "DEVUELTO" : alq.estado === "parcial" ? "PARCIAL" : "EN OBRA";
+        const fechaSal  = ymd(alq.fecha_salida) || (periodo && periodo.anio_mes) || "-";
+        const fechaEsp  = alq.fecha_devolucion_esperada || "—";
+        const fechaReal = (cerrado && lastRecibo) ? lastRecibo : (ymd(alq.fecha_devolucion_real) || "—");
 
         const infoRows = [
             ["N° Alquiler:", "#" + String(alq.id).padStart(4, "0"), "Estado:", estadoText],
-            ["Cliente:", alq.cliente_nombre || "", "ID/NIT:", alq.cliente_id_doc || ""],
-            ["Telefono:", alq.cliente_tel || "", "Direccion:", alq.cliente_dir || ""],
-            ["Fecha salida:", fechaSal, "Dev. esperada:", fechaEsp],
-            ["Operario:", alq.operario || "", "Dev. real:", fechaReal],
+            ["Cliente:", alq.cliente_nombre || "—", "ID/NIT:", alq.cliente_id_doc || "—"],
+            ["Telefono:", alq.cliente_tel || "—", "Direccion:", alq.cliente_dir || alq.obra || "—"],
+            ["Periodo:", periodo?.anio_mes || alq.periodo || "—", "Obra:", alq.obra || "—"],
+            ["Fecha salida:", fechaSal, "Dev. real:", fechaReal === "—" ? fechaEsp : fechaReal],
         ];
 
         const IH = 18;
@@ -1189,9 +1454,9 @@ app.get("/alquileres/:id/pdf", authMiddleware, async (req, res) => {
         doc.font("Helvetica-Bold").fontSize(11).fillColor("#1e3a5f").text("Detalle de Articulos", L, iy);
         iy += 18;
 
-        const CW  = [50, 46, 118, 30, 34, 52, 28, 65];
-        const HDR = ["Ref.", "Tipo", "Articulo", "Cant.", "Dev.", "Precio/dia", "Dias", "Subtotal"];
-        const RH  = 20;
+        const CW  = [200, 40, 40, 70, 75, 90];
+        const HDR = ["Articulo", "Cant.", "Dias", "Precio/dia", "Subtotal", "Salio / entro"];
+        const RH  = 22;
 
         const drawRow = (cells, y, isHeader, isAlt) => {
             const totalW = CW.reduce((a, b) => a + b, 0);
@@ -1211,23 +1476,37 @@ app.get("/alquileres/:id/pdf", authMiddleware, async (req, res) => {
         drawRow(HDR, iy, true, false);
         iy += RH;
         let grandTotal = 0;
-        items.forEach((item, ri) => {
-            const dias     = item.dias_reales || item.dias_acordados || 1;
-            const subtotal = item.total_calculado || (item.precio_dia_aplicado * dias * item.cantidad);
-            grandTotal += subtotal;
-            const tipo = item.es_externo ? (item.empresa_externa || "Externo") : "Propio";
-            drawRow([item.referencia || "", tipo, item.nombre || "", item.cantidad,
-                item.cantidad_devuelta || 0, fmtMoney(item.precio_dia_aplicado), dias, fmtMoney(subtotal)],
-                iy, false, ri % 2 !== 0);
+        if (!lines.length) {
+            drawRow(["Sin detalle de material", "", "", "", "", ""], iy, false, false);
+            iy += RH;
+        }
+        lines.forEach((item, ri) => {
+            grandTotal += Number(item.subtotal) || 0;
+            drawRow([
+                item.nombre || "—",
+                item.cantidad || 0,
+                item.dias || "—",
+                item.precio ? fmtMoney(item.precio) : "—",
+                fmtMoney(item.subtotal),
+                item.rango || "—"
+            ], iy, false, ri % 2 !== 0);
             iy += RH;
             if (iy > 760) { doc.addPage(); iy = 40; drawRow(HDR, iy, true, false); iy += RH; }
         });
+        if (periodo && Number(periodo.total_cobrado) > grandTotal) {
+            grandTotal = Number(periodo.total_cobrado);
+        }
+        if (Number(alq.transporte) > 0) {
+            drawRow(["Transporte / camión", "", "", "", fmtMoney(alq.transporte), ""], iy, false, lines.length % 2 === 0);
+            iy += RH;
+            grandTotal += Number(alq.transporte) || 0;
+        }
 
         iy += 6;
         const TW = 135;
         doc.fillColor("#1e3a5f").rect(L + PW - TW, iy, TW, 26).fill();
         doc.font("Helvetica-Bold").fontSize(12).fillColor("white")
-           .text("TOTAL: " + fmtMoney(grandTotal), L + PW - TW + 4, iy + 7,
+           .text(grandTotal ? ("TOTAL: " + fmtMoney(grandTotal)) : "TOTAL: sin cobro", L + PW - TW + 4, iy + 7,
                  { width: TW - 8, align: "center", lineBreak: false });
         iy += 34;
 

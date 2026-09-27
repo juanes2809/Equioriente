@@ -2,7 +2,7 @@
  * Sube data/store.json a Supabase.
  *
  *   1. Ejecuta supabase_schema.sql en el SQL Editor.
- *   2. Pon SUPABASE_URL y SUPABASE_KEY (service_role) en .env
+ *   2. Pon SUPABASE_URL, SUPABASE_KEY y EQUIORIENTE_APP_KEY en .env
  *   3. node upload_store_to_supabase.js
  */
 "use strict";
@@ -69,7 +69,11 @@ const ORDER = [
     "equioriente_cotizacion_items"
 ];
 
-const sb = createClient(URL, KEY, { auth: { persistSession: false } });
+const APP_KEY = process.env.EQUIORIENTE_APP_KEY || "";
+const sb = createClient(URL, KEY, {
+    auth: { persistSession: false },
+    global: APP_KEY ? { headers: { "x-equioriente-key": APP_KEY } } : undefined
+});
 const BATCH = 100;
 
 async function upsert(table, rows) {

@@ -558,11 +558,17 @@ function parseInventoryCsv(fp) {
     }
     let totalCol = 4;
     let valorCol = 5;
+    let bodegaCol = 1;
+    let alquiladoCol = 2;
+    let subCol = 3;
     if (header >= 0) {
         for (let c = 0; c < (rows[header] || []).length; c++) {
             const u = upper(cell(rows, header, c));
             if (u === "TOTAL MATERIAL" || (/\bTOTAL\b/.test(u) && !/VALOR|AVALUO/.test(u))) totalCol = c;
             if (u === "VALOR UNITARIO") valorCol = c;
+            if (/BODEGA/.test(u)) bodegaCol = c;
+            if (/MATERIAL ALQUILADO/.test(u) && !/SUB/.test(u)) alquiladoCol = c;
+            if (/SUBALQUILADO/.test(u)) subCol = c;
         }
     }
     const start = header >= 0 ? header + 1 : 3;
@@ -575,6 +581,9 @@ function parseInventoryCsv(fp) {
         out.push({
             nombre,
             total,
+            bodega: parseNum(cell(rows, r, bodegaCol)) || 0,
+            alquilado: parseNum(cell(rows, r, alquiladoCol)) || 0,
+            subalquilado: parseNum(cell(rows, r, subCol)) || 0,
             valor_unitario: parseNum(cell(rows, r, valorCol)) || 0
         });
     }
@@ -897,7 +906,7 @@ function main() {
     const articulos = invFile ? parseInventoryCsv(invFile) : [];
     const precios = precioFile ? parsePreciosCsv(precioFile) : [];
     writeCsv(path.join(OUT, "catalogo", "articulos.csv"),
-        ["nombre", "total", "valor_unitario"],
+        ["nombre", "total", "bodega", "alquilado", "subalquilado", "valor_unitario"],
         articulos);
     writeCsv(path.join(OUT, "catalogo", "precios.csv"),
         ["nombre", "precio_dia", "dias_minimos"],

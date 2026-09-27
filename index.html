@@ -189,6 +189,16 @@ td { padding: 14px 18px; text-align: left; border-bottom: 1px solid var(--card-b
 tr { transition: background 0.2s ease; }
 tr:hover { background: rgba(37, 99, 235, 0.04); }
 tr:last-child td { border-bottom: none; }
+#fichaBody tr.remito-salida { background: rgba(220, 38, 38, 0.05); }
+#fichaBody tr.remito-salida:hover { background: rgba(220, 38, 38, 0.09); }
+#fichaBody tr.remito-recibo { background: rgba(5, 150, 105, 0.05); }
+#fichaBody tr.remito-recibo:hover { background: rgba(5, 150, 105, 0.09); }
+.mat-chip {
+  display: inline-block; margin: 2px 4px 2px 0; padding: 2px 8px;
+  border-radius: 999px; font-size: .75rem; font-weight: 500;
+}
+.mat-chip.salida { background: rgba(220, 38, 38, 0.08); color: #9f1239; }
+.mat-chip.recibo { background: rgba(5, 150, 105, 0.08); color: #065f46; }
 
 /* ── Badges ── */
 .badge {
@@ -1194,7 +1204,7 @@ async function loadDashboard() {
   document.getElementById("kpiActivos").textContent = totalActivos;
   document.getElementById("kpiVencidos").textContent = morosos.length;
   document.getElementById("kpiStockBajo").textContent = alertas.length;
-  const ingresoTotal = ingresos.totales?.ingreso_total || 0;
+  const ingresoTotal = Number(ingresos.totales?.ingreso_total || ingresos.totales?.total_ingresos || ingresos.totales?.cobrado_alquiler || 0);
   document.getElementById("kpiIngresos").textContent =
     ingresoTotal >= 1000000
       ? "$" + (ingresoTotal / 1000000).toFixed(1) + "M"
@@ -1498,7 +1508,7 @@ function renderArticulos() {
       <td>${tipoBadge}</td>
       <td>${a.stock_total}</td>
       <td><span class="badge ${dispColor}">${a.stock_disponible}</span></td>
-      <td>${a.stock_alquilado || a.stock_mantenimiento || 0}</td>
+      <td>${a.stock_alquilado ?? 0}</td>
       <td>${a.stock_danado || 0}</td>
       <td>${a.stock_minimo || '-'}</td>
       <td>$${Number(a.precio_dia).toLocaleString()}</td>
@@ -1882,6 +1892,60 @@ async function renderActiveRentals() {
 function escHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+const MESES_CORTOS = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
+function fmtFechaCorta(s) {
+  const m = String(s || "").match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return s || "—";
+  return `${Number(m[3])} ${MESES_CORTOS[Number(m[2]) - 1]}`;
+}
+function normMat(s) {
+  return String(s || "").toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^A-Z0-9]+/g, " ").trim();
+}
+function fechasPorMaterial(remitos) {
+  const map = {};
+  for (const r of remitos || []) {
+    for (const i of r.items || []) {
+      const k = normMat(i.material);
+      if (!k) continue;
+      if (!map[k]) map[k] = { salidas: [], entradas: [] };
+      const cant = Number(i.cantidad) || 0;
+      const row = { fecha: r.fecha, cant: Math.abs(cant), remito: r.numero };
+      if (cant > 0) map[k].salidas.push(row);
+      else if (cant < 0) map[k].entradas.push(row);
+    }
+  }
+  return map;
+}
+function matchMaterialKey(name, map) {
+  const n = normMat(name);
+  if (!n) return null;
+  if (map[n]) return n;
+  const keys = Object.keys(map);
+  const contains = keys.find(k => k.includes(n) || n.includes(k));
+  if (contains) return contains;
+  const tokens = n.split(" ").filter(t => t.length > 2);
+  let best = null, bestN = 0;
+  for (const k of keys) {
+    const overlap = tokens.filter(t => k.includes(t)).length;
+    if (overlap > bestN && overlap >= 2) { bestN = overlap; best = k; }
+  }
+  return best;
+}
+function remitoSentido(r) {
+  const items = r.items || [];
+  const pos = items.filter(i => Number(i.cantidad) > 0).length;
+  const neg = items.filter(i => Number(i.cantidad) < 0).length;
+  if (neg && !pos) return "recibo";
+  if (pos && !neg) return "salida";
+  return pos >= neg ? "salida" : "recibo";
+}
+function periodoCompleto(p) {
+  if (p.estado === "cerrado" || p.estado === "devuelto") return true;
+  const saldos = p.saldos || [];
+  const haySaldo = saldos.some(s => Number(s.cantidad) !== 0);
+  const hayRecibo = (p.remitos || []).some(r => remitoSentido(r) === "recibo");
+  return !haySaldo && hayRecibo;
+}
 
 async function abrirFicha(id) {
   const p = await api("/periodos/" + id).then(r => r.json());
@@ -1890,16 +1954,23 @@ async function abrirFicha(id) {
   document.getElementById("fichaTitulo").textContent = (p.cliente_nombre || "Cliente") + " · " + (p.anio_mes || "");
   document.getElementById("fichaMeta").textContent =
     [p.tipo_documento, p.obra, p.cliente_tel].filter(Boolean).join(" · ");
+  const porMat = fechasPorMaterial(p.remitos);
   const remHtml = (p.remitos || []).length
     ? (p.remitos || []).map(r => {
-        const items = (r.items || []).map(i => `${escHtml(i.material)} (${i.cantidad})`).join(", ");
-        return `<tr>
+        const sentido = remitoSentido(r);
+        const chips = (r.items || []).map(i => {
+          const cant = Number(i.cantidad) || 0;
+          const cls = cant < 0 ? "recibo" : "salida";
+          return `<span class="mat-chip ${cls}">${escHtml(i.material)} (${cant})</span>`;
+        }).join("");
+        const etiqueta = sentido === "recibo" ? "Entró" : "Salió";
+        return `<tr class="remito-${sentido}">
+          <td>${sentido === "recibo" ? "Recibo" : "Salida"}</td>
           <td>${escHtml(r.numero)}</td>
-          <td>${escHtml(r.fecha || "-")}</td>
-          <td>${escHtml(r.hora || "-")}</td>
+          <td>${etiqueta} ${fmtFechaCorta(r.fecha)}${r.hora ? " · " + escHtml(r.hora) : ""}</td>
           <td>${fmtMoney(r.transporte)}</td>
           <td>${escHtml(r.placa || "-")}</td>
-          <td style="font-size:.8rem">${items || "-"}</td>
+          <td>${chips || "-"}</td>
         </tr>`;
       }).join("")
     : '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Sin remitos</td></tr>';
@@ -1907,14 +1978,27 @@ async function abrirFicha(id) {
     ? (p.saldos || []).map(s => `<tr><td>${escHtml(s.material)}</td><td>${s.cantidad}</td></tr>`).join("")
     : '<tr><td colspan="2" style="text-align:center;color:var(--muted)">Sin saldo en obra</td></tr>';
   const cobHtml = (p.cobros || []).length
-    ? (p.cobros || []).map(c => `<tr>
-        <td>${escHtml(c.material)}</td>
-        <td>${c.dias || ""}</td>
-        <td>${c.cantidad || ""}</td>
-        <td>${fmtMoney(c.valor_unitario)}</td>
-        <td><b>${fmtMoney(c.total)}</b></td>
-      </tr>`).join("")
-    : '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Sin cobro en este documento</td></tr>';
+    ? (p.cobros || []).map(c => {
+        const key = matchMaterialKey(c.material, porMat);
+        const hist = key ? porMat[key] : null;
+        const salio = hist?.salidas?.[0]?.fecha;
+        const entro = hist?.entradas?.[0]?.fecha;
+        const dias = c.dias || "";
+        const rango = salio
+          ? (entro
+            ? `${fmtFechaCorta(salio)} → ${fmtFechaCorta(entro)}`
+            : `${fmtFechaCorta(salio)} · sigue en obra`)
+          : (c.periodo_texto || "—");
+        return `<tr>
+          <td>${escHtml(c.material)}</td>
+          <td>${rango}</td>
+          <td>${dias ? dias + " días" : "—"}</td>
+          <td>${c.cantidad || ""}</td>
+          <td>${fmtMoney(c.valor_unitario)}</td>
+          <td><b>${fmtMoney(c.total)}</b></td>
+        </tr>`;
+      }).join("")
+    : '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Sin cobro en este documento</td></tr>';
   const pagHtml = (p.pagos || []).length
     ? (p.pagos || []).map(x => `<tr>
         <td>${escHtml(x.fecha || "-")}</td>
@@ -1953,10 +2037,13 @@ async function abrirFicha(id) {
       <div><label>Placa</label><input id="ficha_rec_placa" placeholder="CWG-768"></div>
       <div><button class="btn btn-primary btn-sm" onclick="agregarRecogidaFicha(${p.alquiler_id || "null"}, ${p.id})">Registrar recogida</button></div>
     </div>
-    ${p.alquiler_id ? `<div style="margin-bottom:12px"><button class="btn btn-warn btn-sm" onclick="closeFicha(); abrirDevolucion(${p.alquiler_id})">Devolver material</button></div>` : ""}
+    ${periodoCompleto(p)
+      ? `<p style="color:var(--muted);font-size:.85rem;margin:0 0 12px">Material ya devuelto. No se puede registrar otra devolución.</p>`
+      : (p.alquiler_id ? `<div style="margin-bottom:12px"><button class="btn btn-warn btn-sm" onclick="closeFicha(); abrirDevolucion(${p.alquiler_id})">Devolver material</button></div>` : "")}
     <div class="card-title">Remitos</div>
+    <p style="color:var(--muted);font-size:.78rem;margin:-4px 0 8px">Rojo suave: salió a obra. Verde suave: volvió a bodega.</p>
     <div class="table-wrap"><table>
-      <thead><tr><th>N°</th><th>Fecha</th><th>Hora</th><th>Transporte</th><th>Placa</th><th>Material</th></tr></thead>
+      <thead><tr><th>Tipo</th><th>N°</th><th>Día</th><th>Transporte</th><th>Placa</th><th>Material</th></tr></thead>
       <tbody>${remHtml}</tbody>
     </table></div>
     <div class="card-title" style="margin-top:18px">Saldo en obra</div>
@@ -1966,7 +2053,7 @@ async function abrirFicha(id) {
     </table></div>
     <div class="card-title" style="margin-top:18px">Cobro</div>
     <div class="table-wrap"><table>
-      <thead><tr><th>Material</th><th>Días</th><th>Cant.</th><th>$/und</th><th>Total</th></tr></thead>
+      <thead><tr><th>Material</th><th>Salió → entró</th><th>Días cobrados</th><th>Cant.</th><th>$/und</th><th>Total</th></tr></thead>
       <tbody>${cobHtml}</tbody>
     </table></div>
     ${pagHtml ? `<div class="card-title" style="margin-top:18px">Abonos</div>
@@ -2007,9 +2094,13 @@ async function agregarRecogidaFicha(alquilerId, periodoId) {
 //  DEVOLUCION PARCIAL
 // ═══════════════════════════════════════
 async function abrirDevolucion(alqId) {
+  const items = await api(`/alquileres/${alqId}/items`).then(r => r.json());
+  const pendientes = (items || []).filter(i => (i.cantidad - (i.cantidad_devuelta || 0)) > 0);
+  if (!pendientes.length) {
+    return toast("Este alquiler ya está devuelto. No hay material pendiente.", "error");
+  }
   devolucionAlqId = alqId;
   document.getElementById("mdAlqId").textContent = "#" + String(alqId).padStart(4, "0");
-  const items = await api(`/alquileres/${alqId}/items`).then(r => r.json());
   const container = document.getElementById("mdItems");
 
   container.innerHTML = items.map(i => {
@@ -2316,22 +2407,24 @@ async function loadEstadisticas() {
 
   // Bar chart
   const meses = data.meses || [];
-  const maxVal = Math.max(...meses.map(m => m.ingreso), 1);
+  const maxVal = Math.max(...meses.map(m => Number(m.ingreso ?? m.ingresos) || 0), 1);
   const barChart = document.getElementById("barChart");
   if (!meses.length) {
     barChart.innerHTML = '<div style="color:var(--muted);font-size:.85rem;align-self:center">Sin datos suficientes</div>';
   } else {
     const monthNames = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
     barChart.innerHTML = meses.map(m => {
-      const pct = Math.round((m.ingreso / maxVal) * 100);
-      const parts = m.mes.split("-");
-      const label = monthNames[parseInt(parts[1], 10) - 1] + " " + parts[0].slice(2);
-      const valFmt = m.ingreso >= 1000000
-        ? "$" + (m.ingreso / 1000000).toFixed(1) + "M"
-        : "$" + Number(m.ingreso).toLocaleString();
+      const ing = Number(m.ingreso ?? m.ingresos) || 0;
+      const pct = Math.round((ing / maxVal) * 100);
+      const parts = String(m.mes || "").split("-");
+      const mi = parseInt(parts[1], 10);
+      const label = (monthNames[mi - 1] || m.mes || "") + (parts[0] ? " " + String(parts[0]).slice(2) : "");
+      const valFmt = ing >= 1000000
+        ? "$" + (ing / 1000000).toFixed(1) + "M"
+        : "$" + ing.toLocaleString("es-CO");
       return `<div class="bar-col">
-        <div class="bar-fill" style="height:${pct}%">
-          <div class="bar-tip">${valFmt}<br>${m.alquileres} alq.</div>
+        <div class="bar-fill" style="height:${Math.max(pct, 4)}%">
+          <div class="bar-tip">${valFmt}<br>${m.alquileres || 0} alq.</div>
         </div>
         <div class="bar-label">${label}</div>
       </div>`;
@@ -2344,7 +2437,7 @@ async function loadEstadisticas() {
     topHtml += `<span class="badge badge-blue" style="margin-right:8px">🏆 Cliente del mes: <b>${data.topCliente.nombre}</b> ($${Number(data.topCliente.total).toLocaleString()})</span>`;
   }
   if (data.topArticulo) {
-    topHtml += `<span class="badge badge-green">📦 Articulo mas alquilado: <b>${data.topArticulo.nombre}</b> (${data.topArticulo.total_cant} uds.)</span>`;
+    topHtml += `<span class="badge badge-green">📦 Articulo mas alquilado: <b>${data.topArticulo.nombre}</b> (${data.topArticulo.total_cant ?? data.topArticulo.total ?? 0} uds.)</span>`;
   }
   document.getElementById("statsTopInfo").innerHTML = topHtml;
 }
@@ -2440,8 +2533,8 @@ async function loadReporte(tipo) {
 
     contentDiv.innerHTML = `<div class="table-wrap"><table>
       <thead><tr><th>Fecha</th><th>Alquileres</th><th>Ingreso</th></tr></thead>
-      <tbody>${data.detalle.map(r => `<tr>
-        <td>${r.fecha}</td><td>${r.total_alquileres}</td><td><b>$${Number(r.ingreso_total).toLocaleString()}</b></td>
+      <tbody>${(data.detalle || []).map(r => `<tr>
+        <td>${r.fecha || r.detalle || "—"}</td><td>${r.total_alquileres ?? "—"}</td><td><b>${fmtMoney(r.ingreso_total ?? r.total)}</b></td>
       </tr>`).join("") || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">Sin datos</td></tr>'}</tbody>
     </table></div>`;
 
@@ -2450,8 +2543,8 @@ async function loadReporte(tipo) {
     contentDiv.innerHTML = `<div class="table-wrap"><table>
       <thead><tr><th>Ref.</th><th>Articulo</th><th>Total Unidades Alquiladas</th><th>Veces Alquilado</th></tr></thead>
       <tbody>${data.map(r => `<tr>
-        <td><span class="badge badge-gray">${r.referencia}</span></td><td><b>${r.nombre}</b></td>
-        <td>${r.total_alquilado}</td><td>${r.veces_alquilado}</td>
+        <td><span class="badge badge-gray">${r.referencia || "—"}</span></td><td><b>${r.nombre || r.material || "—"}</b></td>
+        <td>${r.total_unidades ?? r.total_alquilado ?? 0}</td><td>${r.veces_alquilado ?? 0}</td>
       </tr>`).join("") || '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Sin datos</td></tr>'}</tbody>
     </table></div>`;
 
@@ -2468,18 +2561,14 @@ async function loadReporte(tipo) {
   } else if (tipo === "costos-externos") {
     const data = await api("/reportes/costos-externos").then(r => r.json());
     contentDiv.innerHTML = `<div class="table-wrap"><table>
-      <thead><tr><th>Articulo</th><th>Proveedor</th><th>Costo Proveedor</th><th>Ingreso Generado</th><th>Margen</th></tr></thead>
-      <tbody>${data.map(r => {
-        const margen = r.ingreso_generado - r.costo_total_proveedor;
-        const margenColor = margen >= 0 ? "var(--accent)" : "var(--danger)";
-        return `<tr>
-          <td><span class="badge badge-gray">${r.referencia}</span> <b>${r.nombre}</b></td>
-          <td>${r.empresa_externa || '-'}</td>
-          <td style="color:var(--danger)">$${Number(r.costo_total_proveedor).toLocaleString()}</td>
-          <td>$${Number(r.ingreso_generado).toLocaleString()}</td>
-          <td><b style="color:${margenColor}">$${Number(margen).toLocaleString()}</b></td>
-        </tr>`;
-      }).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Sin datos</td></tr>'}</tbody>
+      <thead><tr><th>Articulo</th><th>Proveedor</th><th>Devoluciones</th><th>Días</th><th>Costo</th></tr></thead>
+      <tbody>${data.map(r => `<tr>
+          <td><span class="badge badge-gray">${r.referencia || "—"}</span> <b>${r.nombre || "—"}</b></td>
+          <td>${r.empresa_externa || "—"}</td>
+          <td>${r.total_devoluciones ?? 0}</td>
+          <td>${r.total_dias ?? 0}</td>
+          <td style="color:var(--danger)"><b>${fmtMoney(r.total_costo ?? r.costo_total_proveedor)}</b></td>
+        </tr>`).join("") || '<tr><td colspan="5" style="text-align:center;color:var(--muted)">Sin datos</td></tr>'}</tbody>
     </table></div>`;
 
   } else if (tipo === "morosos") {
@@ -2487,12 +2576,12 @@ async function loadReporte(tipo) {
     contentDiv.innerHTML = `<div class="table-wrap"><table>
       <thead><tr><th>Alquiler</th><th>Cliente</th><th>Telefono</th><th>Fecha Salida</th><th>Dev. Esperada</th><th>Dias Retraso</th></tr></thead>
       <tbody>${data.map(r => `<tr style="background:#fef2f2">
-        <td><span class="badge badge-red">#${String(r.alquiler_id).padStart(4, "0")}</span></td>
-        <td><b>${r.nombre}</b><br><small>${r.identificacion || ''}</small></td>
-        <td>${r.telefono || '-'}</td>
-        <td>${(r.fecha_salida || '').substr(0, 10)}</td>
-        <td>${(r.fecha_devolucion_esperada || '').substr(0, 10)}</td>
-        <td><span class="badge badge-red">${r.dias_retraso} dias</span></td>
+        <td><span class="badge badge-red">#${String(r.id ?? r.alquiler_id).padStart(4, "0")}</span></td>
+        <td><b>${r.cliente_nombre || r.nombre || "—"}</b></td>
+        <td>${r.cliente_tel || r.telefono || "—"}</td>
+        <td>${(r.fecha_salida || "").toString().slice(0, 10) || "—"}</td>
+        <td>${(r.fecha_devolucion_esperada || "").toString().slice(0, 10) || "—"}</td>
+        <td><span class="badge badge-red">${r.dias_mora ?? r.dias_retraso ?? 0} días</span></td>
       </tr>`).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Sin morosos</td></tr>'}</tbody>
     </table></div>`;
   }
