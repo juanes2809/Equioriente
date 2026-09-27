@@ -165,9 +165,10 @@ if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR);
 // ── Auth middleware ───────────────────────────────────
 function authMiddleware(req, res, next) {
     const h = req.headers.authorization;
-    if (!h?.startsWith("Bearer ")) return res.status(401).json({ error: "Token requerido" });
+    const token = h?.startsWith("Bearer ") ? h.split(" ")[1] : (req.query && req.query.token);
+    if (!token) return res.status(401).json({ error: "Token requerido" });
     try {
-        req.user = jwt.verify(h.split(" ")[1], JWT_SECRET);
+        req.user = jwt.verify(token, JWT_SECRET);
         next();
     } catch { res.status(401).json({ error: "Token invalido o expirado" }); }
 }

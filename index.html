@@ -452,7 +452,7 @@ tr:last-child td { border-bottom: none; }
 
       <div class="dash-cols">
         <div class="card" style="margin-bottom:0">
-          <div class="card-title">📋 Alquileres Recientes</div>
+          <div class="card-title">📋 Cuentas recientes (todos los meses)</div>
           <div id="dashRecentRentals" style="color:var(--muted);font-size:.875rem;padding:8px 0">Cargando...</div>
         </div>
         <div class="card" style="margin-bottom:0">
@@ -471,8 +471,8 @@ tr:last-child td { border-bottom: none; }
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <select id="filtroMesAlq" onchange="renderActiveRentals()" style="width:160px;padding:8px">
-            <option value="">Todos los meses</option>
-            <option value="2026-09" selected>Septiembre 2026</option>
+            <option value="" selected>Todos los meses</option>
+            <option value="2026-09">Septiembre 2026</option>
             <option value="2026-07">Julio 2026</option>
             <option value="2026-06">Junio 2026</option>
             <option value="2026-05">Mayo 2026</option>
@@ -1181,15 +1181,15 @@ async function loadDashboard() {
   const desde30 = new Date(today); desde30.setDate(desde30.getDate() - 30);
   const fmt = d => d.toISOString().substr(0, 10);
 
-  const mesDash = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
-  const [activos, parciales, morosos, alertas, ingresos] = await Promise.all([
-    api("/periodos?estado=activo&anio_mes=" + mesDash).then(r => r.json()),
+  const [periodos, parciales, morosos, alertas, ingresos] = await Promise.all([
+    api("/periodos").then(r => r.json()),
     api("/alquileres?estado=parcial").then(r => r.json()).catch(() => []),
     api("/reportes/morosos").then(r => r.json()),
     api("/articulos/alertas").then(r => r.json()),
     api(`/reportes/ingresos?desde=${fmt(desde30)}&hasta=${fmt(today)}`).then(r => r.json())
   ]);
 
+  const activos = (periodos || []).filter(p => p.estado === "activo");
   const totalActivos = activos.length + parciales.length;
   document.getElementById("kpiActivos").textContent = totalActivos;
   document.getElementById("kpiVencidos").textContent = morosos.length;
@@ -1201,12 +1201,12 @@ async function loadDashboard() {
       : "$" + Number(ingresoTotal).toLocaleString();
 
   // Recent rentals
-  const recientes = [...activos, ...parciales]
-    .sort((a, b) => new Date(b.fecha_salida) - new Date(a.fecha_salida))
-    .slice(0, 6);
+  const recientes = [...(periodos || [])]
+    .sort((a, b) => String(b.anio_mes || "").localeCompare(String(a.anio_mes || "")) || (b.id - a.id))
+    .slice(0, 8);
   const rrEl = document.getElementById("dashRecentRentals");
   if (!recientes.length) {
-    rrEl.innerHTML = '<div style="padding:12px 0;color:var(--muted)">Sin alquileres activos</div>';
+    rrEl.innerHTML = '<div style="padding:12px 0;color:var(--muted)">Sin cuentas cargadas</div>';
   } else {
     rrEl.innerHTML = recientes.map(a => {
       const isOverdue = a.fecha_devolucion_esperada && new Date(a.fecha_devolucion_esperada) < today;
@@ -1214,11 +1214,13 @@ async function loadDashboard() {
         ? '<span class="badge badge-red">Vencido</span>'
         : a.estado === "parcial"
         ? '<span class="badge badge-orange">Parcial</span>'
+        : a.estado === "cerrado"
+        ? '<span class="badge badge-gray">Cerrado</span>'
         : '<span class="badge badge-green">Activo</span>';
       return `<div class="dash-list-item">
         <div>
           <span class="badge badge-blue">${a.anio_mes || ""}</span>
-          <b style="margin-left:6px">${a.cliente_nombre}</b>
+          <b style="margin-left:6px">${escHtml(a.cliente_nombre)}</b>
         </div>
         ${badge}
       </div>`;
@@ -1242,14 +1244,17 @@ async function loadDashboard() {
     const meta = await api("/datos/meta").then(r => r.json());
     const s = meta.stats || meta.conteos || {};
     const el = document.getElementById("dashImportMeta");
-    if (el) el.innerHTML = `<b>Datos conjuntos:</b>
-      ${s.articulos || meta.conteos?.articulos || 0} articulos (inventario) ·
+    const porMes = {};
+    for (const p of periodos || []) porMes[p.anio_mes || "?"] = (porMes[p.anio_mes || "?"] || 0) + 1;
+    const mesTxt = Object.keys(porMes).sort().map(m => `${m} (${porMes[m]})`).join(" · ");
+    if (el) el.innerHTML = `<b>${meta.origen === "supabase" ? "Supabase" : "Local"}:</b>
+      ${s.articulos || meta.conteos?.articulos || 0} articulos ·
       ${s.clientes || meta.conteos?.clientes || 0} clientes ·
-      ${s.periodos || meta.conteos?.periodos || s.alquileres || meta.conteos?.alquileres || 0} cuentas/mes ·
+      ${s.periodos || meta.conteos?.periodos || 0} cuentas ·
       ${s.remitos || meta.conteos?.remitos || 0} remitos ·
-      ${s.flujo || meta.conteos?.flujo || 0} movimientos de caja ·
+      ${s.flujo || meta.conteos?.flujo || 0} caja ·
       ${s.documentos || meta.conteos?.documentos || 0} archivos
-      <span style="margin-left:8px;opacity:.8">${meta.imported_at ? ("Importado " + String(meta.imported_at).slice(0,16).replace("T"," ")) : ""}</span>`;
+      <div style="margin-top:6px;opacity:.9">${mesTxt || "sin meses"}</div>`;
   } catch { /* ignore */ }
 }
 
@@ -2496,6 +2501,13 @@ async function loadReporte(tipo) {
 // ═══════════════════════════════════════
 //  HISTORIAL
 // ═══════════════════════════════════════
+async function abrirPdf(id) {
+  const res = await api("/alquileres/" + id + "/pdf");
+  if (!res.ok) return toast((await res.text()) || "No se pudo abrir el PDF", "error");
+  const blob = await res.blob();
+  window.open(URL.createObjectURL(blob), "_blank");
+}
+
 async function loadHistorial() {
   historialData = await api("/alquileres").then(r => r.json());
   renderHistorial();
@@ -2540,7 +2552,7 @@ async function renderHistorial() {
       <td>${row.operario}</td>
       <td>${estadoBadge}</td>
       <td><b>$${row.total.toLocaleString()}</b></td>
-      <td><a class="btn btn-ghost btn-sm" href="/alquileres/${row.id}/pdf" target="_blank">PDF</a>
+      <td><button class="btn btn-ghost btn-sm" onclick="abrirPdf(${row.id})">PDF</button>
         ${row.estado !== "devuelto" ? `<button class="btn btn-warn btn-sm" onclick="abrirDevolucion(${row.id})">Devolver</button>` : ""}
       </td>
     </tr>`;
