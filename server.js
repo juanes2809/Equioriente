@@ -402,14 +402,18 @@ app.delete("/articulos/:id", authMiddleware, async (req, res) => {
             [T.dp, "devoluciones a proveedor"],
             [T.dn, "daños o perdidas"],
             [T.it, "alquileres"],
+            [T.ri, "remitos"],
+            [T.sp, "saldos de periodo"],
+            [T.cb, "cobros"],
             [T.sm, "subalquiler"],
-            [T.ss, "saldo subalquilado"],
-            [T.mv, "movimientos de inventario"]
+            [T.ss, "saldo subalquilado"]
         ];
         for (const [table, label] of bloqueos) {
             const rows = await sq(sb.from(table).select("id").eq("articulo_id", id).limit(1));
             if (rows.length) return res.status(400).send("No se puede borrar: tiene " + label);
         }
+        const { error: movErr } = await sb.from(T.mv).delete().eq("articulo_id", id);
+        if (movErr) throw new Error(movErr.message);
         await sqDelete(T.ar, id);
         res.json({ msg: "Eliminado" });
     } catch (e) { res.status(500).send(e.message); }
@@ -778,7 +782,7 @@ app.get("/reportes/morosos", authMiddleware, async (req, res) => {
 });
 
 app.get("/reportes/estadisticas", authMiddleware, async (req, res) => {
-    try { res.json(await buildEstadisticas()); }
+    try { res.json(await buildEstadisticas(req.query.mes || "")); }
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -898,15 +902,13 @@ function ymPasado() {
     return `${p.getFullYear()}-${String(p.getMonth() + 1).padStart(2, "0")}`;
 }
 
-async function buildEstadisticas() {
-    const thisMonth = ymHoy();
-    const prevMonth = ymPasado();
+async function buildEstadisticas(reqMes = "") {
     const [periodos, cuentas, clientes, cobros, articulos] = await Promise.all([
-        sq(sb.from(T.pe).select("id, cuenta_id, anio_mes, total_cobrado, estado")),
-        sq(sb.from(T.cu).select("id, cliente_id")),
+        sq(sb.from(T.pe).select("id, cuenta_id, anio_mes, total_cobrado, transporte, estado, tipo_documento")),
+        sq(sb.from(T.cu).select("id, cliente_id, tipo_documento")),
         sq(sb.from(T.cl).select("id, nombre")),
         sq(sb.from(T.cb).select("periodo_id, articulo_id, material, cantidad, total")),
-        sq(sb.from(T.ar).select("id, nombre"))
+        sq(sb.from(T.ar).select("id, nombre, stock_total, stock_disponible, stock_alquilado, stock_subalquilado, stock_danado"))
     ]);
     const ctaMap = byId(cuentas);
     const cliMap = byId(clientes);
@@ -915,49 +917,98 @@ async function buildEstadisticas() {
     for (const p of periodos) {
         const m = p.anio_mes || "";
         if (!m) continue;
-        if (!byMes[m]) byMes[m] = { mes: m, alquileres: 0, ingreso: 0 };
+        if (!byMes[m]) byMes[m] = { mes: m, alquileres: 0, activos: 0, cerrados: 0, ingreso: 0, transporte: 0 };
         byMes[m].alquileres += 1;
+        if (p.estado === "activo") byMes[m].activos += 1;
+        else byMes[m].cerrados += 1;
         byMes[m].ingreso += Number(p.total_cobrado) || 0;
+        byMes[m].transporte += Number(p.transporte) || 0;
     }
-    const meses = Object.keys(byMes).sort().map(k => byMes[k]);
-    const ofMonth = m => periodos.filter(p => p.anio_mes === m);
+    const mesesKeys = Object.keys(byMes).sort();
+    const meses = mesesKeys.map(k => byMes[k]);
+
+    // Si no se especificó mes o el mes actual del calendario no tiene registros, usar el último mes con operación
+    let thisMonth = reqMes || ymHoy();
+    if (!reqMes && !byMes[thisMonth] && mesesKeys.length) {
+        thisMonth = mesesKeys[mesesKeys.length - 1];
+    }
+    const idxThis = mesesKeys.indexOf(thisMonth);
+    const prevMonth = idxThis > 0 ? mesesKeys[idxThis - 1] : ymPasado();
+
+    const ofMonth = m => (m === "todos" ? periodos : periodos.filter(p => p.anio_mes === m));
     const ingresoMes = m => ofMonth(m).reduce((s, p) => s + (Number(p.total_cobrado) || 0), 0);
     const alsMes = ofMonth(thisMonth);
     const cobroByCli = {};
+    const cuentasByCli = {};
     for (const p of alsMes) {
         const cid = ctaMap.get(String(p.cuenta_id))?.cliente_id;
         if (!cid) continue;
         cobroByCli[cid] = (cobroByCli[cid] || 0) + (Number(p.total_cobrado) || 0);
+        cuentasByCli[cid] = (cuentasByCli[cid] || 0) + 1;
     }
-    const topCid = Object.keys(cobroByCli).sort((a, b) => cobroByCli[b] - cobroByCli[a])[0];
+    const sortedClis = Object.keys(cobroByCli).sort((a, b) => cobroByCli[b] - cobroByCli[a]);
+    const topCid = sortedClis[0];
     const topCliente = topCid ? {
         nombre: cliMap.get(String(topCid))?.nombre || "",
         total: cobroByCli[topCid]
     } : null;
+    const topClientesList = sortedClis.slice(0, 6).map(cid => ({
+        id: Number(cid),
+        nombre: cliMap.get(String(cid))?.nombre || "Cliente",
+        total: cobroByCli[cid],
+        cuentas: cuentasByCli[cid] || 1
+    }));
+
     const perIdsMes = new Set(alsMes.map(p => p.id));
     const byArt = {};
+    const byArtMonto = {};
     for (const c of cobros) {
         if (!perIdsMes.has(c.periodo_id)) continue;
         const key = c.articulo_id ? String(c.articulo_id) : "m:" + (c.material || "");
         byArt[key] = (byArt[key] || 0) + (Number(c.cantidad) || 0);
+        byArtMonto[key] = (byArtMonto[key] || 0) + (Number(c.total) || 0);
     }
-    const topAid = Object.keys(byArt).sort((a, b) => byArt[b] - byArt[a])[0];
+    const sortedArts = Object.keys(byArt).sort((a, b) => byArt[b] - byArt[a]);
+    const topAid = sortedArts[0];
+    const resolveArtName = k => k.startsWith("m:") ? k.slice(2) : (artMap.get(k)?.nombre || "");
     let topArticulo = null;
     if (topAid) {
-        const nombre = topAid.startsWith("m:")
-            ? topAid.slice(2)
-            : (artMap.get(topAid)?.nombre || "");
-        topArticulo = { nombre, total: byArt[topAid], total_cant: byArt[topAid] };
+        topArticulo = { nombre: resolveArtName(topAid), total: byArt[topAid], total_cant: byArt[topAid] };
     }
+    const topArticulosList = sortedArts.slice(0, 6).map(k => ({
+        nombre: resolveArtName(k),
+        cantidad: byArt[k],
+        monto: byArtMonto[k] || 0
+    }));
+
+    const porTipoFiscal = { fiscal: 0, no_fiscal: 0, seguimiento: 0 };
+    for (const p of alsMes) {
+        const td = p.tipo_documento || ctaMap.get(String(p.cuenta_id))?.tipo_documento || "seguimiento";
+        if (td === "fiscal") porTipoFiscal.fiscal += 1;
+        else if (td === "no_fiscal") porTipoFiscal.no_fiscal += 1;
+        else porTipoFiscal.seguimiento += 1;
+    }
+
+    const totalCobradoAnual = periodos.reduce((s, p) => s + (Number(p.total_cobrado) || 0), 0);
+    const totalTransporteAnual = periodos.reduce((s, p) => s + (Number(p.transporte) || 0), 0);
+
     return {
+        mesReferencia: thisMonth,
+        mesAnteriorRef: prevMonth,
         totalArticulos: articulos.length,
         totalClientes: clientes.length,
         alquileresActivos: periodos.filter(p => p.estado === "activo").length,
-        mesActual: { alquileres: alsMes.length, ingreso: ingresoMes(thisMonth), ingresos: ingresoMes(thisMonth) },
-        mesPasado: { alquileres: ofMonth(prevMonth).length, ingreso: ingresoMes(prevMonth), ingresos: ingresoMes(prevMonth) },
+        totalPeriodos: periodos.length,
+        totalCobradoAnual,
+        totalTransporteAnual,
+        mesActual: { mes: thisMonth, alquileres: alsMes.length, ingreso: ingresoMes(thisMonth), ingresos: ingresoMes(thisMonth) },
+        mesPasado: { mes: prevMonth, alquileres: ofMonth(prevMonth).length, ingreso: ingresoMes(prevMonth), ingresos: ingresoMes(prevMonth) },
         meses,
         topCliente,
-        topArticulo
+        topArticulo,
+        topClientesList,
+        topArticulosList,
+        porTipoFiscal
     };
 }
 
