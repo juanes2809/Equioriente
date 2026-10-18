@@ -663,7 +663,7 @@ tr:last-child td { border-bottom: none; }
           <table>
             <thead><tr>
               <th>Ref.</th><th>Nombre</th><th>Cat.</th><th>Tipo</th>
-              <th>Total</th><th>Bodega</th><th>En obra</th><th>Danado</th><th>Min.</th><th>$/dia</th><th>Acciones</th>
+              <th>Total</th><th>Bodega</th><th>En obra</th><th>Subalq.</th><th>Danado</th><th>Min.</th><th>$/dia</th><th>Acciones</th>
             </tr></thead>
             <tbody id="tablaArticulos"></tbody>
           </table>
@@ -703,6 +703,20 @@ tr:last-child td { border-bottom: none; }
 
     <!-- PROVEEDORES -->
     <div id="proveedores" class="tab">
+      <div class="card">
+        <div class="card-title" style="margin-bottom:12px">Formaleta subalquilada (saldo actual)</div>
+        <p style="color:var(--muted);font-size:.85rem;margin-bottom:12px">
+          Material prestado por otros (Alquiobras, Luna Sanchez, Jerez, Polimys…). No suma al total propio.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Proveedor</th><th>Ref.</th><th>Material</th><th>Saldo</th>
+            </tr></thead>
+            <tbody id="tablaSubalq"></tbody>
+          </table>
+        </div>
+      </div>
       <div class="card">
         <div class="card-title">Registrar Devolucion a Proveedor</div>
         <p style="color:var(--muted);font-size:.85rem;margin-bottom:16px">
@@ -1476,7 +1490,8 @@ async function editarArticulo(id) {
 }
 function eliminarArticulo(id) {
   showConfirm("Eliminar articulo?", async () => {
-    await api(`/articulos/${id}`, { method: "DELETE" });
+    const res = await api(`/articulos/${id}`, { method: "DELETE" });
+    if (!res.ok) return toast(await res.text(), "error");
     await loadAll();
     toast("Articulo eliminado");
   });
@@ -1492,7 +1507,7 @@ function renderArticulos() {
     return matchQ && matchCat;
   });
   if (!lista.length) {
-    tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--muted);padding:24px">Sin articulos</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--muted);padding:24px">Sin articulos</td></tr>';
     return;
   }
   tbody.innerHTML = lista.map(a => {
@@ -1509,6 +1524,7 @@ function renderArticulos() {
       <td>${a.stock_total}</td>
       <td><span class="badge ${dispColor}">${a.stock_disponible}</span></td>
       <td>${a.stock_alquilado ?? 0}</td>
+      <td>${a.stock_subalquilado ? `<span class="badge badge-purple">${a.stock_subalquilado}</span>` : 0}</td>
       <td>${a.stock_danado || 0}</td>
       <td>${a.stock_minimo || '-'}</td>
       <td>$${Number(a.precio_dia).toLocaleString()}</td>
@@ -2204,7 +2220,7 @@ async function registrardaño() {
 
   const tipo = data.tipo === "perdida" ? "perdida" : "daño";
   showConfirm(`Registrar ${tipo} de ${data.cantidad} unidad(es)?`, async () => {
-    const res = await api("/daños", { method: "POST", body: JSON.stringify(data) });
+    const res = await api("/danos", { method: "POST", body: JSON.stringify(data) });
     if (!res.ok) return toast(await res.text(), "error");
     toast("Registro creado correctamente");
     document.getElementById("daño_desc").value = "";
@@ -2219,7 +2235,7 @@ async function registrardaño() {
 async function loaddaños() {
   populatedañoSelects();
   const estado = document.getElementById("filtrodañoEstado")?.value || "";
-  const url = estado ? `/daños?estado=${estado}` : "/daños";
+  const url = estado ? `/danos?estado=${estado}` : "/danos";
   const rows = await api(url).then(r => r.json());
   const tbody = document.getElementById("tabladaños");
   if (!rows.length) {
@@ -2234,7 +2250,7 @@ async function loaddaños() {
     const estadoBadge = r.estado === "reparado"
       ? '<span class="badge badge-green">Reparado</span>'
       : '<span class="badge badge-orange">Pendiente</span>';
-    const acciones = r.tipo === "daño" && r.estado === "pendiente"
+    const acciones = r.tipo !== "perdida" && r.estado === "pendiente"
       ? `<button class="btn btn-success btn-sm" onclick="reparardaño(${r.id})">Reparar</button>`
       : "-";
     return `<tr>
@@ -2253,7 +2269,7 @@ async function loaddaños() {
 
 function reparardaño(id) {
   showConfirm("Marcar como reparado y devolver al inventario?", async () => {
-    const res = await api(`/daños/${id}/reparar`, { method: "PUT" });
+    const res = await api(`/danos/${id}/reparar`, { method: "PUT" });
     if (!res.ok) return toast(await res.text(), "error");
     toast("Articulo reparado y devuelto al inventario");
     await loadAll();
@@ -2265,11 +2281,14 @@ function reparardaño(id) {
 //  PROVEEDORES
 // ═══════════════════════════════════════
 function populateProvArticulos() {
-  const externos = articulos.filter(a => a.es_externo && a.stock_disponible > 0);
+  const externos = articulos.filter(a =>
+    (a.es_externo && ((a.stock_disponible || 0) > 0 || (a.stock_subalquilado || 0) > 0))
+    || (a.stock_subalquilado || 0) > 0
+  );
   const sel = document.getElementById("prov_articulo");
   sel.innerHTML = '<option value="">-- Seleccionar articulo externo --</option>' +
     externos.map(a =>
-      `<option value="${a.id}">[${a.referencia}] ${a.nombre} - ${a.empresa_externa || 'Ext.'} (${a.stock_disponible} disp.)</option>`
+      `<option value="${a.id}">[${a.referencia}] ${a.nombre} - ${a.empresa_externa || 'Ext.'} (${a.stock_subalquilado || a.stock_disponible} uds.)</option>`
     ).join("");
 }
 
@@ -2279,7 +2298,7 @@ function onProvArticuloChange() {
   const strip = document.getElementById("provArtInfo");
   if (a) {
     document.getElementById("pai_empresa").textContent = a.empresa_externa || '-';
-    document.getElementById("pai_stock").textContent = a.stock_disponible;
+    document.getElementById("pai_stock").textContent = (a.stock_subalquilado || 0) || a.stock_disponible;
     document.getElementById("pai_costo").textContent = Number(a.costo_proveedor_dia || 0).toLocaleString();
     document.getElementById("prov_costo_dia").value = a.costo_proveedor_dia || "";
     strip.classList.remove("hidden");
@@ -2312,8 +2331,9 @@ async function registrarDevolucionProveedor() {
   if (!cantidad || cantidad < 1) return toast("Cantidad invalida", "error");
 
   const art = articulos.find(a => a.id == articulo_id);
-  if (art && cantidad > art.stock_disponible)
-    return toast(`Solo hay ${art.stock_disponible} unidades disponibles`, "warn");
+  const prestado = Math.max(art?.stock_subalquilado || 0, art?.stock_disponible || 0);
+  if (art && cantidad > prestado)
+    return toast(`Solo hay ${prestado} unidades para devolver`, "warn");
 
   showConfirm(`Confirmar devolucion de ${cantidad} unidad(es) a proveedor?`, async () => {
     const res = await api("/devoluciones_proveedor", {
@@ -2342,6 +2362,17 @@ async function registrarDevolucionProveedor() {
 
 async function loadProveedores() {
   populateProvArticulos();
+  const sub = await api("/subalquiler").then(r => r.json()).catch(() => []);
+  const tSub = document.getElementById("tablaSubalq");
+  const saldos = (Array.isArray(sub) ? sub : []).filter(s => Number(s.saldo) > 0);
+  tSub.innerHTML = saldos.length
+    ? saldos.map(s => `<tr>
+        <td><b>${s.proveedor}</b></td>
+        <td><span class="badge badge-gray">${s.referencia || "—"}</span></td>
+        <td>${s.nombre || s.material}</td>
+        <td><span class="badge badge-purple">${s.saldo}</span></td>
+      </tr>`).join("")
+    : '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:16px">Sin saldo subalquilado</td></tr>';
   const rows = await api("/devoluciones_proveedor").then(r => r.json());
   const tbody = document.getElementById("tablaDevProv");
   if (!rows.length) {

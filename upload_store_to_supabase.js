@@ -63,6 +63,8 @@ const ORDER = [
     "equioriente_saldos_periodo",
     "equioriente_cobros",
     "equioriente_viajes",
+    "equioriente_subalquiler_mov",
+    "equioriente_subalquiler_saldo",
     "equioriente_devoluciones_proveedor",
     "equioriente_movimientos_inventario",
     "equioriente_registro_danos",

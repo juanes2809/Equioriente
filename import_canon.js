@@ -8,63 +8,16 @@ const fs = require("fs");
 const path = require("path");
 const bcrypt = require("bcrypt");
 const { readCsvFile } = require("./lib/csvUtil");
+const { parseSubalquiladaXlsx } = require("./lib/parseSubalquilada");
+const { upper, materialKey, findArticulo, attachKeys } = require("./lib/materialMatch");
 
 const CANON = path.join(__dirname, "data", "canon");
 const STORE = path.join(__dirname, "data", "store.json");
 
-function stripAccents(s) {
-    return String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-}
-function upper(s) { return stripAccents(s).toUpperCase().replace(/\s+/g, " ").trim(); }
-
-function normMaterial(s) {
-    let t = upper(s);
-    t = t.replace(/FORAMLETA/g, "FORMALETA");
-    t = t.replace(/FORMALETAS?/g, "TABLERO METALICO");
-    t = t.replace(/TABLEROS? METALICOS?/g, "TABLERO METALICO");
-    t = t.replace(/MTROS|METROS|MTRS|MTS\b/g, "M");
-    t = t.replace(/CENTIMETROS|CMS\b/g, "CM");
-    t = t.replace(/CHAPETAS?( CUADRADAS?)?/g, "CHAPETAS");
-    t = t.replace(/CRUCETAS?( DE ANDAMIOS?)?/g, "CRUCETAS");
-    t = t.replace(/MARCOS DE ANDAMIOS?/g, "MARCOS ANDAMIO");
-    t = t.replace(/MARCOS DE ANDAMIO/g, "MARCOS ANDAMIO");
-    t = t.replace(/CERCHAS?/g, "CERCHA");
-    t = t.replace(/PARALES/g, "PARAL");
-    t = t.replace(/ALINEADORES/g, "ALINEADOR");
-    t = t.replace(/ANGULOS/g, "ANGULO");
-    t = t.replace(/RINCONERAS/g, "RINCONERA");
-    t = t.replace(/TABLONES/g, "TABLON");
-    t = t.replace(/BANDAS/g, "BANDA");
-    t = t.replace(/TABLEROS DE MADERA|TABLERO DE MADERA|TABREROS DE MADERA/g, "TABLERO MADERA");
-    t = t.replace(/RUEDAS( NIVELADORAS| PARA ANDAMIOS| DE ANDAMIO)?/g, "RUEDAS ANDAMIO");
-    t = t.replace(/CAJAS METALICAS|CAJA METALICA/g, "CAJA METALICA");
-    t = t.replace(/SECCIONES DE ANDAMIO|SECCION DE ANDAMIO/g, "MARCOS ANDAMIO");
-    t = t.replace(/CORBATAS|CRORBATAS/g, "CORBATA");
-    t = t.replace(/[,]/g, ".");
-    t = t.replace(/[xX×]/g, "*");
-    t = t.replace(/[^A-Z0-9*. ]/g, " ");
-    t = t.replace(/\s+/g, " ").trim();
-    return t;
-}
-function dims(s) {
-    const nums = String(s).match(/\d+(?:\.\d+)?/g) || [];
-    return nums.map(n => {
-        let x = Number(n);
-        if (x > 0 && x <= 10) x = Math.round(x * 100);
-        return Math.round(x);
-    }).sort((a, b) => a - b);
-}
-function materialKey(s) {
-    const n = normMaterial(s);
-    const d = dims(n);
-    const words = n.replace(/[0-9*.]/g, " ").split(" ").filter(w => w.length > 1);
-    return words.slice(0, 4).join(" ") + (d.length ? " " + d.join("*") : "");
-}
-
 function categoriaDe(nombre) {
     const n = upper(nombre);
     if (/ANDAMIO|MARCOS|CRUCETA|TABLON|RUEDA|PASAMANOS/.test(n)) return "Andamios";
-    if (/TABLERO METALICO|FORMALETA|RINCONERA|ANGULO|CHAPETA|TENSOR|ALINEADOR|CORBATA/.test(n)) return "Formaleta";
+    if (/TABLERO METALICO|FORMALETA|RINCONERA|ANGULO|CHAPETA|TENSOR|ALINEADOR|CORBATA|PINES/.test(n)) return "Formaleta";
     if (/PARAL/.test(n)) return "Puntales";
     if (/CERCHA/.test(n)) return "Cerchas";
     if (/MADERA|BANDA|TABLERO MADERA/.test(n)) return "Madera";
@@ -94,22 +47,6 @@ function nextId(seq, table) {
 function num(v, d = 0) {
     const n = Number(v);
     return Number.isFinite(n) ? n : d;
-}
-
-function findArticulo(articulos, nombre) {
-    const key = materialKey(nombre);
-    let hit = articulos.find(a => a._key === key);
-    if (hit) return hit;
-    const n = normMaterial(nombre);
-    hit = articulos.find(a => a._norm === n);
-    if (hit) return hit;
-    const d = dims(n).join("*");
-    const head = n.split(" ").filter(w => !/^\d/.test(w)).slice(0, 2).join(" ");
-    if (d && head) {
-        hit = articulos.find(a => a._dims === d && a._norm.startsWith(head));
-        if (hit) return hit;
-    }
-    return null;
 }
 
 async function main() {
@@ -156,7 +93,9 @@ async function main() {
         equioriente_documentos: [],
         equioriente_cotizaciones: [],
         equioriente_cotizacion_items: [],
-        equioriente_viajes: []
+        equioriente_viajes: [],
+        equioriente_subalquiler_mov: [],
+        equioriente_subalquiler_saldo: []
     };
     const seq = {};
     seq.equioriente_usuarios = existingUsers.reduce((m, u) => Math.max(m, Number(u.id) || 0), 0);
@@ -197,17 +136,92 @@ async function main() {
             es_externo: 0,
             empresa_externa: null,
             costo_proveedor_dia: 0,
-            categoria_id: catId(categoriaDe(row.nombre)),
-            _key: materialKey(row.nombre),
-            _norm: normMaterial(row.nombre),
-            _dims: dims(normMaterial(row.nombre)).join("*")
+            categoria_id: catId(categoriaDe(row.nombre))
         };
+        attachKeys(art);
         articulos.push(art);
         const { _key, _norm, _dims, ...clean } = art;
         tables.equioriente_articulos.push(clean);
         art._key = _key; art._norm = _norm; art._dims = _dims;
     }
     console.log("Artículos (solo catálogo):", articulos.length);
+
+    const subXlsx = path.join(__dirname, "Equioriente_Data", "FORMALETA SUBALQUILADA 2026.xlsx");
+    if (fs.existsSync(subXlsx)) {
+        const sub = await parseSubalquiladaXlsx(subXlsx);
+        const byArtSub = new Map();
+        for (const s of sub.saldos) {
+            if (!s.saldo) continue;
+            let art = findArticulo(articulos, s.material);
+            if (!art && s.saldo > 0) {
+                const id = nextId(seq, "equioriente_articulos");
+                art = {
+                    id,
+                    referencia: makeRef(s.material, usedRef),
+                    nombre: s.material,
+                    stock_total: 0,
+                    stock_disponible: 0,
+                    stock_mantenimiento: 0,
+                    stock_danado: 0,
+                    stock_minimo: 0,
+                    stock_alquilado: 0,
+                    stock_subalquilado: 0,
+                    precio_dia: 0,
+                    valor_unitario: 0,
+                    dias_minimos: 1,
+                    es_externo: 1,
+                    empresa_externa: s.proveedor,
+                    costo_proveedor_dia: 0,
+                    categoria_id: catId(categoriaDe(s.material))
+                };
+                attachKeys(art);
+                articulos.push(art);
+                const { _key, _norm, _dims, ...clean } = art;
+                tables.equioriente_articulos.push(clean);
+                art._key = _key; art._norm = _norm; art._dims = _dims;
+            }
+            if (!art) continue;
+            const q = Number(s.saldo) || 0;
+            if (q > 0) byArtSub.set(art.id, (byArtSub.get(art.id) || 0) + q);
+            if (art.es_externo && !art.empresa_externa) art.empresa_externa = s.proveedor;
+            tables.equioriente_subalquiler_saldo.push({
+                id: nextId(seq, "equioriente_subalquiler_saldo"),
+                proveedor: s.proveedor,
+                articulo_id: art.id,
+                material: s.material,
+                saldo: q
+            });
+        }
+        for (const [id, q] of byArtSub) {
+            const art = articulos.find(a => a.id === id);
+            if (art) art.stock_subalquilado = q;
+            const row = tables.equioriente_articulos.find(a => a.id === id);
+            if (row) {
+                row.stock_subalquilado = q;
+                if (art) {
+                    row.es_externo = art.es_externo;
+                    row.empresa_externa = art.empresa_externa;
+                }
+            }
+        }
+        for (const m of sub.movimientos) {
+            const art = findArticulo(articulos, m.material);
+            tables.equioriente_subalquiler_mov.push({
+                id: nextId(seq, "equioriente_subalquiler_mov"),
+                proveedor: m.proveedor,
+                articulo_id: art ? art.id : null,
+                material: m.material,
+                fecha: m.fecha || null,
+                hora: m.hora || null,
+                remito: m.remito || null,
+                cantidad: m.cantidad,
+                cliente_ref: m.cliente_ref || null,
+                notas: m.notas || null
+            });
+        }
+        console.log("Subalquilado:", sub.movimientos.length, "movimientos,",
+            [...byArtSub.values()].reduce((s, n) => s + n, 0), "uds en saldo");
+    }
 
     const usedIdent = new Set();
     const cliByName = new Map();
@@ -539,7 +553,8 @@ async function main() {
                 cobros: tables.equioriente_cobros.length,
                 viajes: tables.equioriente_viajes.length,
                 flujo: tables.equioriente_flujo_caja.length,
-                documentos: tables.equioriente_documentos.length
+                documentos: tables.equioriente_documentos.length,
+                subalquiler: tables.equioriente_subalquiler_mov.length
             }
         }
     };

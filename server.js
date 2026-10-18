@@ -79,6 +79,8 @@ const T = {
     sp: "equioriente_saldos_periodo",
     cb: "equioriente_cobros",
     vj: "equioriente_viajes",
+    sm: "equioriente_subalquiler_mov",
+    ss: "equioriente_subalquiler_saldo",
 };
 
 // ── Helpers Supabase ──────────────────────────────────
@@ -218,6 +220,11 @@ const flat = (row, joinKey, mapping) => {
 // ── Express ───────────────────────────────────────────
 const app = express();
 app.use(express.json());
+app.use((req, res, next) => {
+    const raw = decodeURIComponent(req.url);
+    if (raw.startsWith("/daños")) req.url = raw.replace("/daños", "/danos");
+    next();
+});
 app.use(express.static(__dirname));
 
 if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR);
@@ -389,8 +396,23 @@ app.put("/articulos/:id", authMiddleware, async (req, res) => {
 });
 
 app.delete("/articulos/:id", authMiddleware, async (req, res) => {
-    try { await sqDelete(T.ar, req.params.id); res.json({ msg: "Eliminado" }); }
-    catch (e) { res.status(500).send(e.message); }
+    try {
+        const id = req.params.id;
+        const bloqueos = [
+            [T.dp, "devoluciones a proveedor"],
+            [T.dn, "daños o perdidas"],
+            [T.it, "alquileres"],
+            [T.sm, "subalquiler"],
+            [T.ss, "saldo subalquilado"],
+            [T.mv, "movimientos de inventario"]
+        ];
+        for (const [table, label] of bloqueos) {
+            const rows = await sq(sb.from(table).select("id").eq("articulo_id", id).limit(1));
+            if (rows.length) return res.status(400).send("No se puede borrar: tiene " + label);
+        }
+        await sqDelete(T.ar, id);
+        res.json({ msg: "Eliminado" });
+    } catch (e) { res.status(500).send(e.message); }
 });
 
 // ── MOVIMIENTOS ───────────────────────────────────────
@@ -558,40 +580,79 @@ app.put("/alquileres/:id/devolver", authMiddleware, async (req, res) => {
 });
 
 // ── DAÑOS / PÉRDIDAS ──────────────────────────────────
-app.post("/danos", authMiddleware, async (req, res) => {
+function normDanoTipo(t) {
+    const s = String(t || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    return s === "perdida" ? "perdida" : "dano";
+}
+
+async function postDano(req, res) {
     try {
         const { articulo_id, alquiler_id, cliente_id, cantidad, tipo, descripcion, costo_reparacion, cobrado_cliente, monto_cobrado } = req.body;
-        if (!articulo_id || !cantidad) return res.status(400).send("Datos incompletos");
+        const cant = parseInt(cantidad, 10);
+        if (!articulo_id || !Number.isFinite(cant) || cant < 1) return res.status(400).send("Datos incompletos");
+        const art = await sqOne(sb.from(T.ar).select("*").eq("id", articulo_id));
+        if (!art) return res.status(404).send("Articulo no encontrado");
+
+        const tipoNorm = normDanoTipo(tipo);
+        const bodega = Math.max(0, Number(art.stock_disponible) || 0);
+        const obra = Math.max(0, Number(art.stock_alquilado) || 0);
+        const sub = Math.max(0, Number(art.stock_subalquilado) || 0);
+        const fromBodega = Math.min(cant, bodega);
+        const fromObra = Math.min(cant - fromBodega, obra);
+        const fromSub = Math.min(cant - fromBodega - fromObra, sub);
+        if (fromBodega + fromObra + fromSub < cant) {
+            return res.status(400).send("No hay tantas unidades para registrar");
+        }
+
+        const alqId = alquiler_id ? parseInt(alquiler_id, 10) : null;
+        const cliId = cliente_id ? parseInt(cliente_id, 10) : null;
         const r = await sqInsert(T.dn, {
-            articulo_id, alquiler_id: alquiler_id || null, cliente_id: cliente_id || null,
-            cantidad, tipo: tipo || "dano", descripcion: descripcion || null,
+            articulo_id,
+            alquiler_id: Number.isFinite(alqId) ? alqId : null,
+            cliente_id: Number.isFinite(cliId) ? cliId : null,
+            cantidad: cant,
+            tipo: tipoNorm,
+            descripcion: descripcion || null,
             costo_reparacion: costo_reparacion || 0,
-            cobrado_cliente: cobrado_cliente ? 1 : 0, monto_cobrado: monto_cobrado || 0,
+            cobrado_cliente: cobrado_cliente ? 1 : 0,
+            monto_cobrado: monto_cobrado || 0,
             usuario_id: req.user.id
         });
-        if (tipo === "perdida") {
-            await ajustarStock(articulo_id, { total: -cantidad, disponible: -cantidad });
-            await logMov(articulo_id, "perdida", cantidad, descripcion || "Perdida", alquiler_id, req.user.id);
+        if (tipoNorm === "perdida") {
+            await ajustarStock(articulo_id, {
+                total: -(fromBodega + fromObra),
+                disponible: -fromBodega,
+                alquilado: -fromObra
+            });
+            if (fromSub) {
+                await sqUpdate(T.ar, { stock_subalquilado: sub - fromSub }, articulo_id);
+            }
+            await logMov(articulo_id, "perdida", cant, descripcion || "Perdida", alqId || null, req.user.id);
         } else {
-            await ajustarStock(articulo_id, { disponible: -cantidad, danado: cantidad });
-            await logMov(articulo_id, "dano", cantidad, descripcion || "Dano", alquiler_id, req.user.id);
+            await ajustarStock(articulo_id, {
+                disponible: -fromBodega,
+                alquilado: -fromObra,
+                danado: fromBodega + fromObra
+            });
+            await logMov(articulo_id, "dano", cant, descripcion || "Dano", alqId || null, req.user.id);
         }
         res.json({ id: r.lastID });
     } catch (e) { res.status(500).send(e.message); }
-});
+}
 
-app.put("/danos/:id/reparar", authMiddleware, async (req, res) => {
+async function repararDano(req, res) {
     try {
         const dano = await sqOne(sb.from(T.dn).select("*").eq("id", req.params.id));
         if (!dano) return res.status(404).send("Registro no encontrado");
+        if (dano.tipo === "perdida") return res.status(400).send("Una perdida no se repara");
         await sqUpdate(T.dn, { estado: "reparado" }, req.params.id);
         await ajustarStock(dano.articulo_id, { danado: -dano.cantidad, disponible: dano.cantidad });
         await logMov(dano.articulo_id, "reparacion", dano.cantidad, "Reparacion completada", null, req.user.id);
         res.json({ msg: "Articulo reparado y devuelto al inventario" });
     } catch (e) { res.status(500).send(e.message); }
-});
+}
 
-app.get("/danos", authMiddleware, async (req, res) => {
+async function listDanos(req, res) {
     try {
         const { estado } = req.query;
         let q = sb.from(T.dn)
@@ -606,37 +667,73 @@ app.get("/danos", authMiddleware, async (req, res) => {
             art: undefined, cli: undefined, op: undefined
         })));
     } catch (e) { res.status(500).json({ error: e.message }); }
-});
+}
+
+app.post("/danos", authMiddleware, postDano);
+app.post("/daños", authMiddleware, postDano);
+app.put("/danos/:id/reparar", authMiddleware, repararDano);
+app.put("/daños/:id/reparar", authMiddleware, repararDano);
+app.get("/danos", authMiddleware, listDanos);
+app.get("/daños", authMiddleware, listDanos);
 
 // ── DEVOLUCIONES A PROVEEDOR ──────────────────────────
 app.post("/devoluciones_proveedor", authMiddleware, async (req, res) => {
     try {
         const { articulo_id, cantidad, fecha_retiro, costo_proveedor_dia, notas } = req.body;
-        if (!articulo_id || !cantidad) return res.status(400).send("Datos incompletos");
+        const cant = parseInt(cantidad, 10);
+        if (!articulo_id || !Number.isFinite(cant) || cant < 1) return res.status(400).send("Datos incompletos");
         const art = await sqOne(sb.from(T.ar).select("*").eq("id", articulo_id));
         if (!art) return res.status(404).send("Articulo no encontrado");
-        if (art.stock_disponible < cantidad)
-            return res.status(400).send(`Solo hay ${art.stock_disponible} unidades disponibles`);
+        const sub = Math.max(0, Number(art.stock_subalquilado) || 0);
+        const disp = Math.max(0, Number(art.stock_disponible) || 0);
+        if (cant > sub && cant > disp)
+            return res.status(400).send(`Solo hay ${Math.max(sub, disp)} unidades para devolver`);
 
         const fechaRetiro = fecha_retiro ? new Date(fecha_retiro) : new Date();
         const diasReales  = Math.max(1, Math.ceil((new Date() - fechaRetiro) / 86400000));
         const costoDia    = parseFloat(costo_proveedor_dia) || art.costo_proveedor_dia || 0;
-        const totalCosto  = costoDia * diasReales * cantidad;
+        const totalCosto  = costoDia * diasReales * cant;
 
         const r = await sqInsert(T.dp, {
-            articulo_id, cantidad, fecha_retiro: fecha_retiro || null,
+            articulo_id, cantidad: cant, fecha_retiro: fecha_retiro || null,
             dias_reales: diasReales, costo_proveedor_dia: costoDia,
             total_costo: totalCosto, notas: notas || null, usuario_id: req.user.id
         });
 
-        if (art.stock_total - cantidad <= 0) {
-            await sqDelete(T.ar, articulo_id);
-        } else {
-            await ajustarStock(articulo_id, { total: -cantidad, disponible: -cantidad });
+        const fromSub = Math.min(cant, sub);
+        const fromDisp = Math.min(cant - fromSub, disp);
+        await sqUpdate(T.ar, {
+            stock_subalquilado: sub - fromSub,
+            stock_disponible: disp - fromDisp
+        }, articulo_id);
+
+        const saldos = await sq(sb.from(T.ss).select("id,saldo").eq("articulo_id", articulo_id).order("saldo", { ascending: false }));
+        let rest = fromSub;
+        for (const s of saldos) {
+            if (rest <= 0) break;
+            const take = Math.min(rest, Math.max(0, Number(s.saldo) || 0));
+            if (!take) continue;
+            await sqUpdate(T.ss, { saldo: (Number(s.saldo) || 0) - take }, s.id);
+            rest -= take;
         }
-        await logMov(articulo_id, "devolucion_proveedor", cantidad, "Devolucion a proveedor", r.lastID, req.user.id);
+
+        await logMov(articulo_id, "devolucion_proveedor", cant, "Devolucion a proveedor", r.lastID, req.user.id);
         res.json({ id: r.lastID, diasReales, totalCosto });
     } catch (e) { res.status(500).send(e.message); }
+});
+
+app.get("/subalquiler", authMiddleware, async (req, res) => {
+    try {
+        const saldos = await sq(sb.from(T.ss)
+            .select(`*, art:${T.ar}!articulo_id(nombre, referencia)`)
+            .order("proveedor"));
+        res.json(saldos.map(s => ({
+            ...s,
+            referencia: s.art?.referencia || null,
+            nombre: s.art?.nombre || s.material,
+            art: undefined
+        })).sort((a, b) => (b.saldo - a.saldo) || String(a.proveedor).localeCompare(String(b.proveedor))));
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/devoluciones_proveedor", authMiddleware, async (req, res) => {
@@ -778,7 +875,8 @@ app.get("/datos/meta", authMiddleware, async (req, res) => {
                 cobros: (await sq(sb.from(T.cb).select("id"))).length,
                 pagos: (await sq(sb.from(T.pg).select("id"))).length,
                 flujo: (await sq(sb.from(T.fl).select("id"))).length,
-                documentos: (await sq(sb.from(T.doc).select("id"))).length
+                documentos: (await sq(sb.from(T.doc).select("id"))).length,
+                subalquiler: (await sq(sb.from(T.sm).select("id"))).length
             }
         });
     } catch (e) { res.status(500).json({ error: e.message }); }

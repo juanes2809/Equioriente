@@ -853,6 +853,8 @@ function classifyDoc(rel) {
         tipo = "seguimiento"; dominio = /2026/.test(u) ? "operacion" : "historico";
     } else if (/ALQUILER/.test(u)) {
         tipo = "alquiler"; dominio = /2026/.test(u) ? "operacion" : "historico";
+    } else if (/SUBALQUILADA/.test(u)) {
+        tipo = "proveedor"; dominio = "operacion";
     } else if (/INVENTARIO|VALOR MATERIAL|LISTO DE PRECIOS|LISTA DE PRECIOS/.test(u)) {
         tipo = "inventario"; dominio = "operacion";
     } else if (/FLUJO/.test(u)) {

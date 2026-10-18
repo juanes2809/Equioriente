@@ -233,6 +233,27 @@ CREATE TABLE IF NOT EXISTS equioriente_cotizacion_items (
     total           FLOAT
 );
 
+CREATE TABLE IF NOT EXISTS equioriente_subalquiler_mov (
+    id          BIGSERIAL PRIMARY KEY,
+    proveedor   TEXT NOT NULL,
+    articulo_id BIGINT REFERENCES equioriente_articulos(id),
+    material    TEXT NOT NULL,
+    fecha       TEXT,
+    hora        TEXT,
+    remito      TEXT,
+    cantidad    FLOAT NOT NULL,
+    cliente_ref TEXT,
+    notas       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS equioriente_subalquiler_saldo (
+    id          BIGSERIAL PRIMARY KEY,
+    proveedor   TEXT NOT NULL,
+    articulo_id BIGINT REFERENCES equioriente_articulos(id),
+    material    TEXT NOT NULL,
+    saldo       FLOAT NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS equioriente_devoluciones_proveedor (
     id                  BIGSERIAL PRIMARY KEY,
     articulo_id         BIGINT NOT NULL REFERENCES equioriente_articulos(id),
@@ -333,7 +354,8 @@ BEGIN
         'equioriente_viajes', 'equioriente_flujo_caja', 'equioriente_documentos',
         'equioriente_cotizaciones', 'equioriente_cotizacion_items',
         'equioriente_devoluciones_proveedor', 'equioriente_movimientos_inventario',
-        'equioriente_registro_danos'
+        'equioriente_registro_danos', 'equioriente_subalquiler_mov',
+        'equioriente_subalquiler_saldo'
     ]
     LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
